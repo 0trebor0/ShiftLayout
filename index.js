@@ -11,4 +11,14 @@ const html = `
 </div>
 `;
 
-console.log(sculptor.convert(html));
+const { layout, drawables } = sculptor.convert(html);
+
+console.log(layout);
+
+// if (Object.keys(drawables).length > 0) {
+//     console.log('\n--- Generated Drawables ---');
+//     for (const [name, content] of Object.entries(drawables)) {
+//         console.log(`\n// res/drawable/${name}`);
+//         console.log(content);
+//     }
+// }
