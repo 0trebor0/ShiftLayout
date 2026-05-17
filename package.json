@@ -1,9 +1,27 @@
 {
-  "name": "html-android-XML-Converter",
-  "version": "1.0.0",
-  "description": "",
+  "name": "shiftlayout",
+  "version": "5.0.0",
+  "description": "Convert HTML and inline CSS into Android XML layouts.",
   "main": "index.js",
-  "keywords": [],
+  "scripts": {
+    "test": "node test\\shiftlayout.test.js",
+    "example": "node examples\\write-android-resources.js"
+  },
+  "files": [
+    "index.js",
+    "lib.js",
+    "src/",
+    "examples/write-android-resources.js",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "android",
+    "xml",
+    "html",
+    "css",
+    "layout"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",

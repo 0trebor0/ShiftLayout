@@ -1,13 +1,13 @@
 # ShiftLayout v5.0.0
 
-**ShiftLayout** converts HTML + CSS into production-ready Android XML layouts. Write your UI in HTML, get back ConstraintLayout, CardView, MaterialButton, TextInputLayout, BottomNavigationView, shape drawables, gradient drawables, and menu files — ready to drop into Android Studio.
+**ShiftLayout** converts HTML + CSS into production-ready Android XML layouts. Write your UI in HTML, get back ConstraintLayout, CardView, MaterialButton, TextInputLayout, BottomNavigationView, shape drawables, gradient drawables, and menu files - ready to drop into Android Studio.
 
 ---
 
 ## Installation
 
 ```bash
-npm install cheerio
+npm install shiftlayout
 ```
 
 ---
@@ -15,7 +15,7 @@ npm install cheerio
 ## Quick Start
 
 ```javascript
-const ShiftLayout = require('./lib.js');
+const ShiftLayout = require('shiftlayout');
 const sculptor = new ShiftLayout({ useConstraint: true });
 
 const html = `
@@ -27,11 +27,11 @@ const html = `
 </div>
 `;
 
-const { layout, drawables, menus } = sculptor.convert(html);
+const { layout, drawables, menus, arrays, values, resources, assets } = sculptor.convert(html);
 
-// layout   → paste into res/layout/activity_main.xml
-// drawables → write each entry to res/drawable/<name>
-// menus     → write each entry to res/menu/<name>
+// layout    -> paste into res/layout/activity_main.xml
+// drawables -> write each entry to res/drawable/<name>
+// menus     -> write each entry to res/menu/<name>
 
 console.log(layout);
 ```
@@ -53,13 +53,17 @@ const sculptor = new ShiftLayout({
 
 ## Output Format
 
-`convert(html)` returns an object with three keys:
+`convert(html)` returns an object with these keys:
 
 | Key | Type | Write to |
 |---|---|---|
 | `layout` | `string` | `res/layout/your_layout.xml` |
 | `drawables` | `{ [filename]: string }` | `res/drawable/` |
 | `menus` | `{ [filename]: string }` | `res/menu/` |
+| `arrays` | `{ [filename]: string }` | `res/values/` per-select string arrays |
+| `values` | `{ [filename]: string }` | Combined `res/values/` files such as `arrays.xml` |
+| `resources` | `{ drawables, menus, values }` | Grouped Android resource files |
+| `assets` | `{ images: Array<{ source, resource }> }` | External image manifest |
 
 ---
 
@@ -73,9 +77,10 @@ const sculptor = new ShiftLayout({
 | `<div>` with `border-radius` + `box-shadow` | `CardView` | Auto-detected; generates `app:cardCornerRadius`, `app:cardElevation` |
 | `<div>` with absolutely positioned children | `FrameLayout` | Auto-detected when any child has `position: absolute` |
 | `<div>` with `overflow-y: scroll` | `ScrollView` wrapping `LinearLayout` | `android:fillViewport="true"` included |
-| `<ul>`, `<ol>` | `LinearLayout` | |
-| `<table>` | `TableLayout` | |
+| `<ul>`, `<ol>` | `LinearLayout` | List item text is prefixed; ordered lists preserve `start` and `reversed` |
+| `<table>` | `TableLayout` | Stretches columns by default |
 | `<tr>` | `TableRow` | |
+| `<td>` `<th>` | `TextView` | `colspan`, `rowspan`, `align`, and `valign` are preserved where possible |
 
 ### Navigation
 
@@ -89,26 +94,32 @@ const sculptor = new ShiftLayout({
 | HTML | Android View |
 |---|---|
 | `<h1>` `<h2>` `<h3>` `<h4>` | `TextView` |
-| `<p>` `<span>` `<label>` `<a>` `<li>` `<legend>` `<td>` `<th>` | `TextView` |
+| `<p>` `<span>` `<label>` `<a>` `<li>` `<legend>` `<td>` `<th>` | `TextView` | Anchor `href` is preserved in `android:tag` |
+| `<strong>` `<b>` `<em>` `<i>` `<code>` `<pre>` `<kbd>` `<cite>` `<mark>` | `TextView` | Semantic text styling applied where possible |
+| `<small>` `<u>` `<s>` `<del>` `<ins>` `<time>` `<abbr>` `<dfn>` `<samp>` `<var>` | `TextView` | Additional inline semantics mapped to Android text attributes |
+| `<blockquote>` `<q>` `<address>` `<sup>` `<sub>` | `TextView` | Lightweight quote/address/script styling |
 
 ### Inputs
 
 | HTML | Android View | Notes |
 |---|---|---|
-| `<input type="text/email/password/number/tel/url/search/date/time">` | `TextInputLayout` + `TextInputEditText` | Material floating label; style from `inputStyle` option |
-| `<textarea>` | `TextInputLayout` + `TextInputEditText` | `android:inputType="textMultiLine"` |
-| `<input type="checkbox">` | `CheckBox` | |
-| `<input type="radio">` | `RadioButton` | |
-| `<input type="submit">` / `<input type="button">` | `MaterialButton` | |
-| `<select>` | `Spinner` | `<option>` children are skipped; populate via adapter in code |
+| `<input type="text/email/password/number/tel/url/search/date/time/datetime-local/month/week/color">` | `TextInputLayout` + `TextInputEditText` | Material floating label; style from `inputStyle` option |
+| `<input inputmode enterkeyhint autocapitalize spellcheck>` | `TextInputEditText` attributes | Keyboard/action hints mapped where Android XML supports them |
+| `<textarea>` | `TextInputLayout` + `TextInputEditText` | `android:inputType="textMultiLine"`; `rows` and `cols` are preserved |
+| `<input type="checkbox">` | `CheckBox` | `value` is preserved in `android:tag` |
+| `<input type="radio">` | `RadioButton` | `value` is preserved in `android:tag` |
+| `<input type="submit/button/reset/file">` | `MaterialButton` | Value text or sensible default label |
+| `<select>` | `Spinner` | `<option>` labels generate a string-array resource; `selected`, `multiple`, `size`, and `disabled` are preserved where possible |
 
 ### Other
 
 | HTML | Android View | Notes |
 |---|---|---|
 | `<button>` | `MaterialButton` | Uses `app:backgroundTint`, `app:cornerRadius`, `app:strokeColor` |
-| `<img>` | `ImageView` | `src="logo.png"` → `@drawable/logo`; `src="@drawable/x"` passed through |
+| `<img>` | `ImageView` | `src="logo.png"` -> `@drawable/logo`; explicit dimensions enable `android:adjustViewBounds` |
+| `<picture>` | unwraps to child media | `<source>` tags are skipped; fallback `<img>` is converted |
 | `<progress value="60" max="100">` | `ProgressBar` | Horizontal style applied automatically when `value`/`max` present |
+| `<meter value="60" max="100">` | `ProgressBar` | Horizontal style with `android:max` and `android:progress` |
 | `<hr>` | `View` (1dp divider) | |
 | `<video>` | `VideoView` | |
 | `<iframe>` | `WebView` | |
@@ -125,7 +136,9 @@ All color formats are supported:
 color: red;                      /* named color */
 color: #6200EE;                  /* hex (3 or 6 digit) */
 color: rgb(98, 0, 238);          /* rgb() */
-color: rgba(0, 0, 0, 0.5);      /* rgba() → Android #AARRGGBB format */
+color: hsl(210, 50%, 40%);       /* hsl() */
+color: hsla(120, 100%, 25%, .5); /* hsla() to Android #AARRGGBB format */
+color: rgba(0, 0, 0, 0.5);      /* rgba() -> Android #AARRGGBB format */
 ```
 
 Named colors: `white`, `black`, `red`, `green`, `blue`, `yellow`, `gray`, `silver`, `transparent`.
@@ -136,15 +149,20 @@ Named colors: `white`, `black`, `red`, `green`, `blue`, `yellow`, `gray`, `silve
 |---|---|
 | `background-color: #FFF` | `android:background="#FFFFFF"` |
 | `background: linear-gradient(to right, #6200EE, #03DAC5)` | `android:background="@drawable/sl_grad_*.xml"` |
+| `background-image: linear-gradient(...)` | `android:background="@drawable/sl_grad_*.xml"` |
+| `background-size: cover` on images | `android:scaleType="centerCrop"` |
+| `background-position: center` on images | `android:scaleType="center"` fallback |
 | `border-radius: 12px` | `android:background="@drawable/sl_bg_*.xml"` with `<corners>` |
 | `border: 2px solid #E0E0E0` | Shape drawable with `<stroke>` |
 | `border-color: #E0E0E0` / `border-width: 2px` | Combined into shape drawable |
+| `outline: 2px solid #6200EE` | Shape drawable stroke when no explicit border overrides it |
 | `box-shadow: 0 4px 12px rgba(...)` | `android:elevation` (blur radius extracted) |
+| `box-shadow: none` / `inset ...` | No elevation emitted |
 | `z-index: 4` | `android:elevation="4dp"` |
 | `opacity: 0.8` | `android:alpha="0.80"` |
 | `overflow: hidden` | `android:clipChildren="true"` + `android:clipToPadding="true"` |
 
-> **Generated drawables** — shape and gradient XML files are returned in the `drawables` map. Write each file to `res/drawable/`.
+> **Generated drawables** - shape and gradient XML files are returned in the `drawables` map. Write each file to `res/drawable/`.
 
 ### Typography
 
@@ -155,13 +173,16 @@ Named colors: `white`, `black`, `red`, `green`, `blue`, `yellow`, `gray`, `silve
 | `font-style: italic` | `android:textStyle="italic"` |
 | `font-family: Georgia, serif` | `android:fontFamily="serif"` |
 | `text-align: center` | `android:gravity="center"` |
+| `text-decoration: underline line-through` | `android:paintFlags="underline|strikeThru"` |
+| `text-indent: 24px` | `android:textIndent="24dp"` |
 | `letter-spacing: 2px` | `android:letterSpacing="0.125"` |
 | `line-height: 1.5` | `android:lineSpacingMultiplier="1.50"` |
 | `white-space: nowrap` | `android:maxLines="1"` + `android:ellipsize="end"` |
+| `overflow-wrap: break-word` | `android:breakStrategy="high_quality"` |
 | `text-overflow: ellipsis` | `android:ellipsize="end"` |
 | `-webkit-line-clamp: 3` | `android:maxLines="3"` + `android:ellipsize="end"` |
 
-Supported font families: Roboto, Open Sans, Lato, Ubuntu → `sans-serif`; Georgia, Times New Roman → `serif`; Courier → `monospace`.
+Supported font families: Roboto, Open Sans, Lato, Ubuntu -> `sans-serif`; Georgia, Times New Roman -> `serif`; Courier -> `monospace`.
 
 ### Layout & Spacing
 
@@ -186,6 +207,7 @@ Supported font families: Roboto, Open Sans, Lato, Ubuntu → `sans-serif`; Georg
 | `justify-content: flex-end` | `android:gravity="end"` or `"bottom"` |
 | `align-items: center` | `android:gravity="center_vertical"` (row) or `"center_horizontal"` (column) |
 | `align-items: stretch` | `android:gravity="fill"` |
+| `gap: 12px` | `android:dividerPadding="12dp"` + `android:showDividers="middle"` |
 
 ### Visibility
 
@@ -216,6 +238,17 @@ Supported font families: Roboto, Open Sans, Lato, Ubuntu → `sans-serif`; Georg
 | `object-fit: fill` | `android:scaleType="fitXY"` |
 | `cursor: pointer` | `android:clickable="true"` + `android:focusable="true"` + ripple foreground |
 
+### Accessibility
+
+| HTML / ARIA | Android output |
+|---|---|
+| `aria-label` / `title` | `android:contentDescription` |
+| `aria-hidden="true"` / `role="presentation"` | `android:importantForAccessibility="no"` |
+| `aria-disabled="true"` | `android:enabled="false"` |
+| `aria-live="polite/assertive"` | `android:accessibilityLiveRegion` |
+| `aria-expanded` / `aria-pressed` | `android:stateDescription` |
+| `dir="rtl/ltr"` / `lang="..."` | Text direction, layout direction, and locale attributes |
+
 ---
 
 ## Examples
@@ -231,7 +264,7 @@ Supported font families: Roboto, Open Sans, Lato, Ubuntu → `sans-serif`; Georg
 </div>
 ```
 
-Generates: `CardView` → `TextInputLayout` (email) → `TextInputLayout` (password, with custom stroke color) → `MaterialButton` with corner radius.
+Generates: `CardView` -> `TextInputLayout` (email) -> `TextInputLayout` (password, with custom stroke color) -> `MaterialButton` with corner radius.
 
 ### Gradient Hero Banner
 
@@ -270,11 +303,24 @@ Generates: parent becomes `FrameLayout`; FAB div uses `android:layout_gravity="e
 
 ---
 
+## Writing Files
+
+Run the example writer to generate an Android-style output tree:
+
+```bash
+node examples/write-android-resources.js
+```
+
+It writes `res/layout`, `res/drawable`, `res/menu`, `res/values`, and an image asset manifest under `examples/android-output/`.
+
+---
+
 ## Notes
 
-- `px` values are automatically converted to `dp` (layout) or `sp` (text).
+- Bare numeric, `px`, `em`, and `rem` values are automatically converted to `dp` (layout) or `sp` (text).
+- Inline CSS comments are ignored and `!important` markers are stripped before conversion.
 - 3-digit hex colors (`#FFF`) are expanded to 6-digit (`#FFFFFF`).
-- `rgba()` transparency is converted to Android's `#AARRGGBB` format.
-- Shape drawables are deduplicated — the same color + radius combination reuses one file.
-- `<select>` entries (`<option>`) are skipped in XML; populate the `Spinner` via a code adapter.
+- `rgba()` and `hsla()` transparency is converted to Android's `#AARRGGBB` format.
+- Shape drawables are deduplicated - the same color + radius combination reuses one file.
+- `<select>` entries (`<option>`) are returned as per-select XML files in `arrays` and combined in `values['arrays.xml']`.
 - `<nav>` menu icon references (`@drawable/ic_nav_1` etc.) must be created manually or replaced with your own icon drawables.

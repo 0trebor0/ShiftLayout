@@ -11,16 +11,21 @@ const TAG_MAP = {
     ul: 'LinearLayout', ol: 'LinearLayout',
     h1: 'TextView', h2: 'TextView', h3: 'TextView', h4: 'TextView',
     p: 'TextView', span: 'TextView', label: 'TextView', a: 'TextView', li: 'TextView',
+    strong: 'TextView', b: 'TextView', em: 'TextView', i: 'TextView',
+    code: 'TextView', pre: 'TextView', kbd: 'TextView', cite: 'TextView', mark: 'TextView',
+    small: 'TextView', u: 'TextView', s: 'TextView', del: 'TextView', ins: 'TextView',
+    time: 'TextView', abbr: 'TextView', dfn: 'TextView', samp: 'TextView', var: 'TextView',
+    blockquote: 'TextView', q: 'TextView', address: 'TextView', sup: 'TextView', sub: 'TextView',
     button: 'com.google.android.material.button.MaterialButton',
     input: 'EditText', textarea: 'EditText',
     img: 'ImageView',
     select: 'Spinner',
-    progress: 'ProgressBar',
+    progress: 'ProgressBar', meter: 'ProgressBar',
     hr: 'View',
     video: 'VideoView',
     iframe: 'WebView',
     fieldset: 'LinearLayout', legend: 'TextView',
-    table: 'TableLayout', tr: 'TableRow', td: 'TextView', th: 'TextView',
+    table: 'TableLayout', tr: 'TableRow', td: 'TextView', th: 'TextView', caption: 'TextView',
 };
 
 const INPUT_TYPE_MAP = {
@@ -33,6 +38,10 @@ const INPUT_TYPE_MAP = {
     search: 'text',
     date: 'date',
     time: 'time',
+    'datetime-local': 'datetime',
+    month: 'date',
+    week: 'date',
+    color: 'text',
 };
 
 const FONT_FAMILY_MAP = {
