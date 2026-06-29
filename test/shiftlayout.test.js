@@ -1,13 +1,23 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const ShiftLayout = require('..');
 const {
-    parseStyle, parseBorder, parseBorderRadius, parseBoxShadow, buildXmlString,
-    pxToDp, pxToSp,
+    parseStyle, parseStyleDeclarations, parseCssStylesheet, normalizeMediaProfile, matchesMediaQuery, selectorSpecificity,
+    parseBorder, parseBorderRadius, parseBoxShadow, buildXmlString,
+    evaluateCssLength, pxToDp, pxToSp,
     resourceNameFromPath, sanitizeColor, extractBackgroundColor,
 } = require('../src/utils');
 
 assert.equal(typeof ShiftLayout, 'function');
+assert.deepEqual(parseStyleDeclarations('color: red !important; width: 10px'), [
+    { property: 'color', value: 'red', important: true },
+    { property: 'width', value: '10px', important: false },
+]);
+assert.equal(parseCssStylesheet('p, .note { color: red; }').length, 1);
+assert.deepEqual(selectorSpecificity('#screen .note p'), [1, 1, 1]);
 
 const converter = new ShiftLayout({ prefix: 'test' });
 const { layout, menus } = converter.convert(`
@@ -58,6 +68,22 @@ assert.equal(buildXmlString('View', { 'android:id': '@+id/ok', 'android:elevatio
 assert.equal(pxToDp('1.5rem'), '24dp');
 assert.equal(pxToDp('0.25em'), '4dp');
 assert.equal(pxToSp('1.25rem'), '20sp');
+assert.equal(evaluateCssLength('calc(10px + 1rem)'), '26dp');
+assert.equal(evaluateCssLength('calc((20px + 4px) / 2)'), '12dp');
+assert.equal(evaluateCssLength('calc(2 * 8px)'), '16dp');
+assert.equal(evaluateCssLength('min(40px, 3rem)'), '40dp');
+assert.equal(evaluateCssLength('max(40px, 3rem)'), '48dp');
+assert.equal(evaluateCssLength('clamp(12px, 2rem, 40px)'), '32dp');
+assert.equal(evaluateCssLength('calc(100% - 16px)'), null);
+assert.equal(evaluateCssLength('calc(10px * 2px)'), null);
+assert.equal(evaluateCssLength('calc(10px / 0)'), null);
+const portraitMedia = normalizeMediaProfile({ width: '37.5rem', height: 800 });
+assert.deepEqual(portraitMedia, { type: 'screen', width: 600, height: 800, orientation: 'portrait' });
+assert.equal(matchesMediaQuery('screen and (min-width: 600px) and (orientation: portrait)', portraitMedia), true);
+assert.equal(matchesMediaQuery('(max-width: 599px), print', portraitMedia), false);
+assert.equal(matchesMediaQuery('not print', portraitMedia), true);
+assert.throws(() => normalizeMediaProfile({ width: '50vw' }), /media\.width/);
+assert.throws(() => normalizeMediaProfile({ orientation: 'square' }), /media\.orientation/);
 
 const spacing = new ShiftLayout().convert(`
     <div id="spacing" style="padding: 0.5rem 0.75rem; margin: 4px 6px 8px 10px;">
@@ -225,6 +251,328 @@ assert.match(layoutDecisions.layout, /android:orientation="horizontal"/);
 assert.match(layoutDecisions.layout, /android:id="@\+id\/gapped"[\s\S]*android:dividerPadding="12dp"/);
 assert.match(layoutDecisions.layout, /android:id="@\+id\/gapped"[\s\S]*android:showDividers="middle"/);
 assert.match(layoutDecisions.layout, /app:cornerRadius="4dp"/);
+
+const flexLayouts = new ShiftLayout().convert(`
+    <div id="basic_flex" style="display: flex; justify-content: center;">
+        <span>Basic</span>
+    </div>
+    <div id="advanced_flex" style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; align-content: space-around;">
+        <span id="third" style="order: 3; flex: 2 0 40%; align-self: flex-end;">Third</span>
+        <span id="first" style="order: 1; flex-basis: 120px;">First</span>
+        <input id="second" style="order: 2; flex-grow: 1; flex-shrink: 0;" placeholder="Second">
+    </div>
+    <div id="column_flex" style="display: flex; flex-direction: column;">
+        <span id="column_item" style="flex-basis: 64px;">Column item</span>
+    </div>
+    <div id="reverse_flex" style="display: flex; flex-direction: row-reverse;">
+        <span>Reverse</span>
+    </div>
+`);
+
+const basicFlexOpenTag = flexLayouts.layout.match(/<LinearLayout\b[^>]*android:id="@\+id\/basic_flex"[^>]*>/)[0];
+assert.match(basicFlexOpenTag, /android:orientation="horizontal"/);
+assert.match(basicFlexOpenTag, /android:gravity="center_horizontal"/);
+assert.match(flexLayouts.layout, /<com\.google\.android\.flexbox\.FlexboxLayout[\s\S]*android:id="@\+id\/advanced_flex"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/advanced_flex"[\s\S]*app:flexWrap="wrap"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/advanced_flex"[\s\S]*app:justifyContent="space_between"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/advanced_flex"[\s\S]*app:alignItems="center"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/advanced_flex"[\s\S]*app:alignContent="space_around"/);
+assert.ok(flexLayouts.layout.indexOf('@+id/first') < flexLayouts.layout.indexOf('@+id/second'));
+assert.ok(flexLayouts.layout.indexOf('@+id/second') < flexLayouts.layout.indexOf('@+id/third'));
+assert.match(flexLayouts.layout, /android:id="@\+id\/third"[\s\S]*app:layout_order="4"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/third"[\s\S]*app:layout_flexGrow="2"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/third"[\s\S]*app:layout_flexShrink="0"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/third"[\s\S]*app:layout_flexBasisPercent="40%"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/third"[\s\S]*app:layout_alignSelf="flex_end"/);
+const firstFlexItem = flexLayouts.layout.match(/<TextView\b[^>]*android:id="@\+id\/first"[^>]*\/>/)[0];
+assert.match(firstFlexItem, /android:layout_width="120dp"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/second"[\s\S]*app:layout_order="3"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/second"[\s\S]*app:layout_flexGrow="1"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/column_flex"[\s\S]*app:flexDirection="column"/);
+const columnFlexItem = flexLayouts.layout.match(/<TextView\b[^>]*android:id="@\+id\/column_item"[^>]*\/>/)[0];
+assert.match(columnFlexItem, /android:layout_height="64dp"/);
+assert.match(flexLayouts.layout, /android:id="@\+id\/reverse_flex"[\s\S]*app:flexDirection="row_reverse"/);
+
+const gridLayouts = new ShiftLayout().convert(`
+    <div id="dashboard_grid" style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: auto 1fr; grid-auto-flow: column; gap: 12px 20px; place-items: center stretch;">
+        <span id="grid_last" style="order: 2; grid-column: 2 / span 2; grid-row: 1 / 3; justify-self: end; align-self: start;">Last</span>
+        <span id="grid_first" style="order: -1; grid-area: 2 / 1 / 3 / 3;">First</span>
+        <input id="grid_input" style="grid-column: 1 / 2;" placeholder="Grid input">
+    </div>
+    <section id="four_columns" style="display: grid; grid-template-columns: repeat(2, 1fr 2fr);">
+        <span>Track count</span>
+    </section>
+`);
+
+const dashboardGridOpenTag = gridLayouts.layout.match(/<GridLayout\b[^>]*android:id="@\+id\/dashboard_grid"[^>]*>/)[0];
+assert.match(dashboardGridOpenTag, /android:columnCount="3"/);
+assert.match(dashboardGridOpenTag, /android:rowCount="2"/);
+assert.match(dashboardGridOpenTag, /android:orientation="vertical"/);
+assert.match(dashboardGridOpenTag, /android:alignmentMode="alignMargins"/);
+assert.ok(gridLayouts.layout.indexOf('@+id/grid_first') < gridLayouts.layout.indexOf('@+id/grid_input'));
+assert.ok(gridLayouts.layout.indexOf('@+id/grid_input') < gridLayouts.layout.indexOf('@+id/grid_last'));
+const gridLastView = gridLayouts.layout.match(/<TextView\b[^>]*android:id="@\+id\/grid_last"[^>]*\/>/)[0];
+assert.match(gridLastView, /android:layout_column="1"/);
+assert.match(gridLastView, /android:layout_columnSpan="2"/);
+assert.match(gridLastView, /android:layout_row="0"/);
+assert.match(gridLastView, /android:layout_rowSpan="2"/);
+assert.match(gridLastView, /android:layout_columnWeight="1"/);
+assert.match(gridLastView, /android:layout_rowWeight="1"/);
+assert.match(gridLastView, /android:layout_gravity="end\|top"/);
+assert.match(gridLastView, /android:layout_marginTop="6dp"/);
+assert.match(gridLastView, /android:layout_marginBottom="6dp"/);
+assert.match(gridLastView, /android:layout_marginLeft="10dp"/);
+assert.match(gridLastView, /android:layout_marginRight="10dp"/);
+const gridFirstView = gridLayouts.layout.match(/<TextView\b[^>]*android:id="@\+id\/grid_first"[^>]*\/>/)[0];
+assert.match(gridFirstView, /android:layout_column="0"/);
+assert.match(gridFirstView, /android:layout_columnSpan="2"/);
+assert.match(gridFirstView, /android:layout_row="1"/);
+assert.match(gridFirstView, /android:layout_rowSpan="1"/);
+assert.match(gridFirstView, /android:layout_gravity="fill_horizontal\|center_vertical"/);
+assert.match(gridLayouts.layout, /android:id="@\+id\/grid_input"[\s\S]*android:layout_column="0"/);
+const fourColumnsOpenTag = gridLayouts.layout.match(/<GridLayout\b[^>]*android:id="@\+id\/four_columns"[^>]*>/)[0];
+assert.match(fourColumnsOpenTag, /android:columnCount="4"/);
+
+const positioning = new ShiftLayout().convert(`
+    <div id="fixed_overlay" style="position: fixed; inset: 16px 24px 32px 40px;"></div>
+    <div id="positioning_parent" style="position: relative; width: 300px; height: 200px;">
+        <span id="fill_parent" style="position: absolute; inset: 0;">Fill</span>
+        <span id="bottom_end" style="position: absolute; right: 12px; bottom: 20px; width: 80px;">End</span>
+        <span id="relative_offset" style="position: relative; left: 10px; bottom: 4px;">Relative</span>
+        <span id="auto_center" style="width: 100px; margin: 0 auto;">Centered</span>
+        <span id="absolute_center" style="position: absolute; inset: 0; width: 80px; height: 40px; margin: auto;">Absolute center</span>
+    </div>
+    <div id="positioned_card" style="border-radius: 12px; box-shadow: 0 2px 6px #000;">
+        <span id="card_badge" style="position: absolute; top: 4px; right: 6px;">Badge</span>
+    </div>
+`);
+
+assert.match(positioning.layout, /android:id="@\+id\/fixed_overlay"[\s\S]*app:layout_constraintStart_toStartOf="parent"/);
+assert.match(positioning.layout, /android:id="@\+id\/fixed_overlay"[\s\S]*app:layout_constraintEnd_toEndOf="parent"/);
+assert.match(positioning.layout, /android:id="@\+id\/fixed_overlay"[\s\S]*app:layout_constraintTop_toTopOf="parent"/);
+assert.match(positioning.layout, /android:id="@\+id\/fixed_overlay"[\s\S]*app:layout_constraintBottom_toBottomOf="parent"/);
+const fixedOverlayTag = positioning.layout.match(/<LinearLayout\b[^>]*android:id="@\+id\/fixed_overlay"[^>]*\/>/)[0];
+assert.match(fixedOverlayTag, /android:layout_width="0dp"/);
+assert.match(fixedOverlayTag, /android:layout_height="0dp"/);
+assert.match(fixedOverlayTag, /android:layout_marginTop="16dp"/);
+assert.match(fixedOverlayTag, /android:layout_marginRight="24dp"/);
+assert.match(fixedOverlayTag, /android:layout_marginBottom="32dp"/);
+assert.match(fixedOverlayTag, /android:layout_marginLeft="40dp"/);
+assert.match(positioning.layout, /<FrameLayout[\s\S]*android:id="@\+id\/positioning_parent"/);
+assert.match(positioning.layout, /android:id="@\+id\/positioning_parent"[\s\S]*app:layout_constraintTop_toTopOf="parent"/);
+const fillParentView = positioning.layout.match(/<TextView\b[^>]*android:id="@\+id\/fill_parent"[^>]*\/>/)[0];
+assert.match(fillParentView, /android:layout_width="match_parent"/);
+assert.match(fillParentView, /android:layout_height="match_parent"/);
+assert.match(fillParentView, /android:layout_gravity="start\|top"/);
+const bottomEndView = positioning.layout.match(/<TextView\b[^>]*android:id="@\+id\/bottom_end"[^>]*\/>/)[0];
+assert.match(bottomEndView, /android:layout_gravity="end\|bottom"/);
+assert.match(bottomEndView, /android:layout_marginRight="12dp"/);
+assert.match(bottomEndView, /android:layout_marginBottom="20dp"/);
+const relativeOffsetView = positioning.layout.match(/<TextView\b[^>]*android:id="@\+id\/relative_offset"[^>]*\/>/)[0];
+assert.match(relativeOffsetView, /android:translationX="10dp"/);
+assert.match(relativeOffsetView, /android:translationY="-4dp"/);
+const autoCenterView = positioning.layout.match(/<TextView\b[^>]*android:id="@\+id\/auto_center"[^>]*\/>/)[0];
+assert.match(autoCenterView, /android:layout_gravity="center_horizontal"/);
+assert.doesNotMatch(autoCenterView, /="auto"/);
+const absoluteCenterView = positioning.layout.match(/<TextView\b[^>]*android:id="@\+id\/absolute_center"[^>]*\/>/)[0];
+assert.match(absoluteCenterView, /android:layout_gravity="center_horizontal\|center_vertical"/);
+assert.match(positioning.layout, /<androidx\.cardview\.widget\.CardView[\s\S]*android:id="@\+id\/positioned_card"[\s\S]*<FrameLayout/);
+assert.match(positioning.layout, /android:id="@\+id\/card_badge"[\s\S]*android:layout_gravity="end\|top"/);
+
+const computedSizes = new ShiftLayout().convert(`
+    <div id="computed_panel" style="width: calc(100px + 2rem); height: clamp(40px, 5rem, 72px); min-width: min(120px, 8rem); max-height: max(160px, 8rem); padding: min(24px, 2rem); margin: calc(8px + 0.5rem) max(4px, 0.25rem); border-radius: calc(4px + 0.25rem);">
+        <span id="computed_text" style="font-size: clamp(14px, 1.25rem, 24px); text-indent: calc(8px * 2);">Computed</span>
+        <span id="computed_offset" style="position: relative; left: calc(4px + 0.5rem);">Offset</span>
+    </div>
+    <div id="computed_grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: calc(8px + 0.5rem);">
+        <span id="computed_gap">Gap</span>
+    </div>
+    <span id="unsupported_math" style="width: calc(100% - 16px);">Fallback</span>
+`);
+
+const computedPanelTag = computedSizes.layout.match(/<LinearLayout\b[^>]*android:id="@\+id\/computed_panel"[^>]*>/)[0];
+assert.match(computedPanelTag, /android:layout_width="132dp"/);
+assert.match(computedPanelTag, /android:layout_height="72dp"/);
+assert.match(computedPanelTag, /android:minWidth="120dp"/);
+assert.match(computedPanelTag, /android:maxHeight="160dp"/);
+assert.match(computedPanelTag, /android:padding="24dp"/);
+assert.match(computedPanelTag, /android:layout_marginTop="16dp"/);
+assert.match(computedPanelTag, /android:layout_marginRight="4dp"/);
+assert.match(computedPanelTag, /android:layout_marginBottom="16dp"/);
+assert.match(computedPanelTag, /android:layout_marginLeft="4dp"/);
+assert.match(computedPanelTag, /android:background="@drawable\/sl_bg_transparent_r8"/);
+const computedTextView = computedSizes.layout.match(/<TextView\b[^>]*android:id="@\+id\/computed_text"[^>]*\/>/)[0];
+assert.match(computedTextView, /android:textSize="20sp"/);
+assert.match(computedTextView, /android:textIndent="16dp"/);
+const computedOffsetView = computedSizes.layout.match(/<TextView\b[^>]*android:id="@\+id\/computed_offset"[^>]*\/>/)[0];
+assert.match(computedOffsetView, /android:translationX="12dp"/);
+const computedGapView = computedSizes.layout.match(/<TextView\b[^>]*android:id="@\+id\/computed_gap"[^>]*\/>/)[0];
+assert.match(computedGapView, /android:layout_marginTop="8dp"/);
+assert.match(computedGapView, /android:layout_marginLeft="8dp"/);
+const unsupportedMathView = computedSizes.layout.match(/<TextView\b[^>]*android:id="@\+id\/unsupported_math"[^>]*\/>/)[0];
+assert.match(unsupportedMathView, /android:layout_width="wrap_content"/);
+assert.doesNotMatch(unsupportedMathView, /calc\(/);
+
+const mediaHtml = `
+    <style>
+        .responsive { color: red; width: 100px; }
+        @media screen and (min-width: 600px) {
+            .responsive { color: blue; width: 200px; }
+            @media (orientation: landscape) {
+                .responsive { font-weight: bold; }
+            }
+        }
+        @media (max-width: 599px), print {
+            .responsive { color: green; width: 140px; }
+        }
+        @media print {
+            .print_only { text-transform: uppercase; }
+        }
+    </style>
+    <p id="responsive" class="responsive">Profile</p>
+    <p id="print_only" class="print_only">Print only</p>
+`;
+
+const desktopMedia = new ShiftLayout().convert(mediaHtml, {
+    media: { width: 800, height: 600 },
+});
+const desktopResponsive = desktopMedia.layout.match(/<TextView\b[^>]*android:id="@\+id\/responsive"[^>]*\/>/)[0];
+assert.match(desktopResponsive, /android:textColor="#0000FF"/);
+assert.match(desktopResponsive, /android:layout_width="200dp"/);
+assert.match(desktopResponsive, /android:textStyle="bold"/);
+assert.match(desktopMedia.layout, /android:id="@\+id\/print_only"[\s\S]*android:text="Print only"/);
+
+const mobileMedia = new ShiftLayout().convert(mediaHtml, {
+    media: { width: 390, height: 844 },
+});
+const mobileResponsive = mobileMedia.layout.match(/<TextView\b[^>]*android:id="@\+id\/responsive"[^>]*\/>/)[0];
+assert.match(mobileResponsive, /android:textColor="#00FF00"/);
+assert.match(mobileResponsive, /android:layout_width="140dp"/);
+assert.doesNotMatch(mobileResponsive, /android:textStyle="bold"/);
+
+const printMedia = new ShiftLayout().convert(mediaHtml, {
+    media: { type: 'print', width: 800, height: 1000 },
+});
+assert.match(printMedia.layout, /android:id="@\+id\/print_only"[\s\S]*android:text="PRINT ONLY"/);
+
+const noMediaProfile = new ShiftLayout().convert(mediaHtml);
+const unprofiledResponsive = noMediaProfile.layout.match(/<TextView\b[^>]*android:id="@\+id\/responsive"[^>]*\/>/)[0];
+assert.match(unprofiledResponsive, /android:textColor="#FF0000"/);
+assert.match(unprofiledResponsive, /android:layout_width="100dp"/);
+
+const linkedMedia = new ShiftLayout().convert(`
+    <link rel="stylesheet" href="responsive.css">
+    <p id="linked_media" class="linked_media">Linked media</p>
+`, {
+    media: { width: '48rem', height: 1024 },
+    stylesheets: {
+        'responsive.css': '@media (min-width: 700px) { .linked_media { color: #123456; } }',
+    },
+});
+assert.match(linkedMedia.layout, /android:id="@\+id\/linked_media"[\s\S]*android:textColor="#123456"/);
+assert.throws(
+    () => new ShiftLayout().convert('<p>Invalid media</p>', { media: 'desktop' }),
+    /media must be an object/
+);
+
+const diagnosticConverter = new ShiftLayout();
+const diagnostics = diagnosticConverter.convert(`
+    <style>
+        .broken[ { color: red; }
+    </style>
+    <link rel="stylesheet" href="missing.css">
+    <div id="diagnostics" class="panel" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 12px; transition: all 200ms; position: sticky; left: 10%; background-image: url(hero.png); box-shadow: inset 0 2px 4px #000; width: calc(100% - 16px); --brand: #123456;">
+        Diagnostics
+    </div>
+`);
+
+assert.ok(Array.isArray(diagnostics.warnings));
+assert.ok(diagnostics.warnings.every(warning => ['code', 'message', 'element', 'property', 'value'].every(key => key in warning)));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'missing-stylesheet' && warning.value === 'missing.css'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'invalid-css-selector' && warning.value === '.broken['));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'unsupported-css-property' && warning.property === 'transition'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.property === 'position'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.property === 'left'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.property === 'background-image'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.property === 'box-shadow'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.property === 'width'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'approximated-css' && warning.property === 'display'));
+assert.ok(diagnostics.warnings.some(warning => warning.code === 'approximated-css' && warning.property === 'gap'));
+assert.ok(diagnostics.warnings.some(warning => warning.element === 'div#diagnostics.panel'));
+assert.ok(!diagnostics.warnings.some(warning => warning.property === '--brand'));
+
+const cleanDiagnostics = diagnosticConverter.convert('<p style="color: #123456;">Clean</p>');
+assert.deepEqual(cleanDiagnostics.warnings, []);
+
+const assetTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'shiftlayout-assets-'));
+try {
+    const assetBase = path.join(assetTestRoot, 'source');
+    const assetOutput = path.join(assetTestRoot, 'android');
+    fs.mkdirSync(path.join(assetBase, 'assets', 'xhdpi'), { recursive: true });
+    fs.writeFileSync(path.join(assetBase, 'assets', 'xhdpi', 'logo@2x.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    fs.writeFileSync(path.join(assetBase, 'assets', 'photo.jpg'), Buffer.from([0xff, 0xd8, 0xff]));
+    fs.writeFileSync(path.join(assetBase, 'assets', 'vector.svg'), `
+        <svg width="24" height="24" viewBox="0 0 24 24">
+            <g id="badge" transform="translate(1 2)">
+                <path id="check" d="M2,12 L9,19 L22,4" fill="none" stroke="#123456" stroke-width="2" stroke-linecap="round" />
+                <rect x="4" y="4" width="8" height="6" rx="2" fill="rgba(10,20,30,0.5)" fill-rule="evenodd" />
+                <circle cx="18" cy="18" r="3" fill="#abcdef" opacity="0.5" />
+            </g>
+        </svg>
+    `, 'utf8');
+    fs.writeFileSync(path.join(assetBase, 'assets', 'unsupported.svg'), `
+        <svg width="24" height="24" viewBox="0 0 24 24">
+            <image href="https://example.com/image.png" width="24" height="24" />
+        </svg>
+    `, 'utf8');
+    fs.writeFileSync(path.join(assetTestRoot, 'outside.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    const assetResult = new ShiftLayout().convert(`
+        <img id="logo_one" src="assets/xhdpi/logo@2x.png?v=1" alt="Logo">
+        <img id="logo_two" src="assets/xhdpi/logo@2x.png?v=1" alt="Logo again">
+        <img id="photo" src="/assets/photo.jpg" data-android-density="hdpi" alt="Photo">
+        <img id="vector" src="assets/vector.svg" alt="Vector">
+        <img id="unsupported_vector" src="assets/unsupported.svg" alt="Unsupported vector">
+        <img id="outside" src="../outside.png" alt="Outside">
+        <img id="remote" src="https://example.com/remote.png" alt="Remote">
+    `);
+
+    assert.match(assetResult.layout, /android:id="@\+id\/logo_one"[\s\S]*android:src="@drawable\/logo"/);
+    assert.match(assetResult.layout, /android:id="@\+id\/logo_two"[\s\S]*android:src="@drawable\/logo"/);
+    assert.equal(assetResult.assets.images.filter(image => image.source.includes('logo@2x')).length, 1);
+    assert.equal(assetResult.assets.images.find(image => image.resource === 'photo').density, 'hdpi');
+
+    const writeReport = ShiftLayout.writeResources(assetOutput, assetResult, {
+        baseDir: assetBase,
+        layoutName: 'Profile Screen',
+    });
+
+    assert.ok(fs.existsSync(path.join(assetOutput, 'res', 'layout', 'profile_screen.xml')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'res', 'drawable-xhdpi', 'logo.png')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'res', 'drawable-hdpi', 'photo.jpg')));
+    const vectorPath = path.join(assetOutput, 'res', 'drawable', 'vector.xml');
+    assert.ok(fs.existsSync(vectorPath));
+    const vectorXml = fs.readFileSync(vectorPath, 'utf8');
+    assert.match(vectorXml, /<vector/);
+    assert.match(vectorXml, /android:viewportWidth="24"/);
+    assert.match(vectorXml, /android:translateX="1"/);
+    assert.match(vectorXml, /android:pathData="M2,12 L9,19 L22,4"/);
+    assert.match(vectorXml, /android:strokeColor="#123456"/);
+    assert.match(vectorXml, /android:strokeLineCap="round"/);
+    assert.match(vectorXml, /android:fillType="evenOdd"/);
+    assert.match(vectorXml, /android:fillAlpha="0\.5"/);
+    assert.ok(fs.existsSync(path.join(assetOutput, 'assets', 'images.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'warnings.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'assets.json')));
+    assert.equal(writeReport.copiedImages.length, 3);
+    assert.ok(writeReport.copiedImages.some(image => image.resource === 'vector' && image.format === 'vector'));
+    assert.ok(writeReport.skippedImages.some(image => image.source.includes('remote.png') && image.reason === 'remote'));
+    assert.ok(writeReport.warnings.some(warning => warning.code === 'unsupported-svg-content' && warning.source.includes('unsupported.svg')));
+    assert.ok(writeReport.warnings.some(warning => warning.code === 'empty-vector' && warning.source.includes('unsupported.svg')));
+    assert.ok(writeReport.warnings.some(warning => warning.code === 'image-outside-base-dir' && warning.source === '../outside.png'));
+} finally {
+    fs.rmSync(assetTestRoot, { recursive: true, force: true });
+}
 
 assert.equal(resourceNameFromPath('https://cdn.example.com/images/123 logo.webp?size=2#hash'), 'placeholder_123_logo');
 
@@ -563,5 +911,90 @@ assert.equal(selects.resources.values['arrays.xml'], selects.values['arrays.xml'
 assert.equal(selects.resources.menus, selects.menus);
 assert.equal(selects.resources.drawables, selects.drawables);
 assert.ok(!selects.layout.includes('<option'));
+
+const stylesheet = new ShiftLayout().convert(`
+    <style>
+        :root {
+            --brand: #336699;
+        }
+        section.panel {
+            --brand: #654321;
+            color: #101010;
+            font-family: Georgia;
+        }
+        p { margin-top: 4px; color: red; }
+        p { margin-top: 8px; }
+        .panel .note { color: var(--brand); font-weight: bold; }
+        #inline_wins { color: #123456; }
+        .important { color: green !important; }
+        [data-tone="alert"] { text-transform: uppercase; }
+        h2, .grouped { text-align: center; }
+        .variable { color: var(--brand, #000000); }
+    </style>
+    <section class="panel">
+        <p id="inline_wins" class="note" style="color: black;">Inline</p>
+        <p id="important" class="note important" style="color: black;">Important</p>
+        <p id="attribute" data-tone="alert">Attribute text</p>
+        <p id="grouped" class="grouped">Grouped</p>
+        <span id="variable" class="variable">Variable</span>
+        <span id="inherited">Inherited</span>
+    </section>
+`);
+
+assert.match(stylesheet.layout, /android:id="@\+id\/inline_wins"[\s\S]*android:textColor="#000000"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/inline_wins"[\s\S]*android:textStyle="bold"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/inline_wins"[\s\S]*android:layout_marginTop="8dp"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/important"[\s\S]*android:textColor="#00FF00"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/attribute"[\s\S]*android:text="ATTRIBUTE TEXT"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/grouped"[\s\S]*android:gravity="center"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/variable"[\s\S]*android:textColor="#654321"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/inherited"[\s\S]*android:textColor="#101010"/);
+assert.match(stylesheet.layout, /android:id="@\+id\/inherited"[\s\S]*android:fontFamily="serif"/);
+assert.ok(!stylesheet.layout.includes('<style'));
+
+const linkedStylesheets = new ShiftLayout().convert(`
+    <style>
+        .status, .after_link { color: red; }
+    </style>
+    <link rel="stylesheet" href="theme.css">
+    <link rel="stylesheet" href="not-provided.css">
+    <style>
+        .after_link { color: #445566; }
+    </style>
+    <p id="link_wins" class="status">Linked</p>
+    <p id="embedded_wins" class="after_link">Embedded</p>
+`, {
+    stylesheets: {
+        'theme.css': '.status, .after_link { color: #112233; width: 200px; }',
+    },
+});
+
+assert.match(linkedStylesheets.layout, /android:id="@\+id\/link_wins"[\s\S]*android:textColor="#112233"/);
+const linkWinsView = linkedStylesheets.layout.match(/<TextView\b[^>]*android:id="@\+id\/link_wins"[^>]*\/>/)[0];
+assert.match(linkWinsView, /android:layout_width="200dp"/);
+assert.match(linkedStylesheets.layout, /android:id="@\+id\/embedded_wins"[\s\S]*android:textColor="#445566"/);
+assert.ok(!linkedStylesheets.layout.includes('<link'));
+
+const mappedStylesheet = new ShiftLayout().convert(`
+    <link rel="stylesheet" href="map.css">
+    <p id="mapped" class="mapped">Map source</p>
+`, {
+    stylesheets: new Map([['map.css', '.mapped { color: #ABCDEF; }']]),
+});
+assert.match(mappedStylesheet.layout, /android:id="@\+id\/mapped"[\s\S]*android:textColor="#ABCDEF"/);
+
+const unloadedStylesheet = new ShiftLayout().convert(`
+    <link rel="stylesheet" href="remote.css">
+    <p id="unloaded">No hidden load</p>
+`);
+assert.doesNotMatch(unloadedStylesheet.layout, /android:id="@\+id\/unloaded"[\s\S]*android:textColor=/);
+assert.throws(
+    () => new ShiftLayout().convert('<p>Invalid</p>', { stylesheets: ['body { color: red; }'] }),
+    /stylesheets must be an object or Map/
+);
+assert.throws(
+    () => new ShiftLayout().convert('<p>Invalid</p>', { stylesheets: { 'theme.css': 42 } }),
+    /must be provided as a CSS string/
+);
 
 console.log('All ShiftLayout tests passed.');

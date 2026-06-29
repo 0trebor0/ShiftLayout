@@ -1,13 +1,33 @@
 const { COLOR_MAP } = require('./constants');
 
 function parseStyle(styleStr) {
-    const styles = {};
-    const declarations = [];
+    return Object.fromEntries(
+        parseStyleDeclarations(styleStr).map(({ property, value }) => [property, value])
+    );
+}
+
+function parseStyleDeclarations(styleStr) {
+    const declarations = splitCssSegments(String(styleStr), ';');
+
+    return declarations.flatMap(declaration => {
+        const colonIdx = findTopLevelCharacter(declaration, ':');
+        if (colonIdx === -1) return [];
+
+        const property = declaration.slice(0, colonIdx).trim().toLowerCase();
+        const rawValue = declaration.slice(colonIdx + 1).trim();
+        const important = /\s*!important\s*$/i.test(rawValue);
+        const value = rawValue.replace(/\s*!important\s*$/i, '').trim();
+        return property && value ? [{ property, value, important }] : [];
+    });
+}
+
+function splitCssSegments(input, delimiter) {
+    const segments = [];
     let current = '';
-    let depth = 0;
+    let parentheses = 0;
+    let brackets = 0;
     let quote = null;
     let inComment = false;
-    const input = String(styleStr);
 
     for (let i = 0; i < input.length; i++) {
         const ch = input[i];
@@ -23,33 +43,291 @@ function parseStyle(styleStr) {
             i++;
         } else if (quote) {
             current += ch;
-            if (ch === quote) quote = null;
+            if (ch === quote && input[i - 1] !== '\\') quote = null;
         } else if (ch === '"' || ch === "'") {
             quote = ch;
             current += ch;
         } else if (ch === '(') {
-            depth++;
+            parentheses++;
             current += ch;
         } else if (ch === ')') {
-            depth = Math.max(0, depth - 1);
+            parentheses = Math.max(0, parentheses - 1);
             current += ch;
-        } else if (ch === ';' && depth === 0) {
-            declarations.push(current);
+        } else if (ch === '[') {
+            brackets++;
+            current += ch;
+        } else if (ch === ']') {
+            brackets = Math.max(0, brackets - 1);
+            current += ch;
+        } else if (ch === delimiter && parentheses === 0 && brackets === 0) {
+            if (current.trim()) segments.push(current.trim());
             current = '';
         } else {
             current += ch;
         }
     }
-    if (current.trim()) declarations.push(current);
 
-    declarations.forEach(declaration => {
-        const colonIdx = declaration.indexOf(':');
-        if (colonIdx === -1) return;
-        const k = declaration.slice(0, colonIdx).trim().toLowerCase();
-        const v = declaration.slice(colonIdx + 1).trim().replace(/\s*!important\s*$/i, '').trim();
-        if (k && v) styles[k] = v;
-    });
-    return styles;
+    if (current.trim()) segments.push(current.trim());
+    return segments;
+}
+
+function findTopLevelCharacter(input, target) {
+    let parentheses = 0;
+    let brackets = 0;
+    let quote = null;
+
+    for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        if (quote) {
+            if (ch === quote && input[i - 1] !== '\\') quote = null;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === '(') {
+            parentheses++;
+        } else if (ch === ')') {
+            parentheses = Math.max(0, parentheses - 1);
+        } else if (ch === '[') {
+            brackets++;
+        } else if (ch === ']') {
+            brackets = Math.max(0, brackets - 1);
+        } else if (ch === target && parentheses === 0 && brackets === 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+function parseCssStylesheet(cssText, mediaConditions = []) {
+    const rules = [];
+    const input = String(cssText || '');
+    let cursor = 0;
+
+    while (cursor < input.length) {
+        const open = findNextCssBrace(input, cursor, '{');
+        if (open === -1) break;
+
+        const prelude = input.slice(cursor, open).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+        const close = findMatchingCssBrace(input, open);
+        if (close === -1) break;
+
+        if (/^@media\b/i.test(prelude)) {
+            const condition = prelude.replace(/^@media\s*/i, '').trim();
+            rules.push(...parseCssStylesheet(input.slice(open + 1, close), [...mediaConditions, condition]));
+        } else if (prelude && !prelude.startsWith('@')) {
+            const selectors = splitCssSegments(prelude, ',');
+            const declarations = parseStyleDeclarations(input.slice(open + 1, close));
+            if (selectors.length && declarations.length) rules.push({ selectors, declarations, mediaConditions });
+        }
+
+        cursor = close + 1;
+    }
+
+    return rules;
+}
+
+function normalizeMediaProfile(profile) {
+    if (profile === undefined || profile === null || profile === false) return null;
+    if (typeof profile !== 'object' || Array.isArray(profile)) {
+        throw new TypeError('media must be an object with target viewport properties.');
+    }
+
+    const normalized = {
+        type: normalizeStyleValue(profile.type || 'screen'),
+        width: normalizeMediaDimension(profile.width, 'width'),
+        height: normalizeMediaDimension(profile.height, 'height'),
+        orientation: normalizeStyleValue(profile.orientation || ''),
+    };
+    if (normalized.orientation && !['portrait', 'landscape'].includes(normalized.orientation)) {
+        throw new TypeError('media.orientation must be "portrait" or "landscape".');
+    }
+    if (!normalized.orientation && normalized.width !== null && normalized.height !== null) {
+        normalized.orientation = normalized.width > normalized.height ? 'landscape' : 'portrait';
+    }
+    return normalized;
+}
+
+function normalizeMediaDimension(value, name) {
+    if (value === undefined || value === null || value === '') return null;
+    const converted = typeof value === 'number' ? value : parseFloat(evaluateCssLength(value, 'dp'));
+    if (!Number.isFinite(converted) || converted < 0) {
+        throw new TypeError(`media.${name} must be a non-negative number or compatible CSS length.`);
+    }
+    return converted;
+}
+
+function matchesMediaQuery(query, profile) {
+    if (!profile) return false;
+    return splitCssSegments(String(query || ''), ',').some(branch => matchesMediaBranch(branch, profile));
+}
+
+function matchesMediaBranch(branch, profile) {
+    let normalized = normalizeStyleValue(branch);
+    let negate = false;
+    if (normalized.startsWith('not ')) {
+        negate = true;
+        normalized = normalized.slice(4).trim();
+    }
+    normalized = normalized.replace(/^only\s+/, '');
+    const clauses = splitMediaClauses(normalized);
+    const matches = clauses.every(clause => matchesMediaClause(clause, profile));
+    return negate ? !matches : matches;
+}
+
+function splitMediaClauses(value) {
+    const clauses = [];
+    let current = '';
+    let depth = 0;
+
+    for (let i = 0; i < value.length; i++) {
+        const ch = value[i];
+        if (ch === '(') depth++;
+        if (ch === ')') depth = Math.max(0, depth - 1);
+        if (depth === 0 && /^\s+and\s+/i.test(value.slice(i))) {
+            if (current.trim()) clauses.push(current.trim());
+            const match = /^\s+and\s+/i.exec(value.slice(i));
+            i += match[0].length - 1;
+            current = '';
+        } else {
+            current += ch;
+        }
+    }
+    if (current.trim()) clauses.push(current.trim());
+    return clauses;
+}
+
+function matchesMediaClause(clause, profile) {
+    const normalized = normalizeStyleValue(clause);
+    if (!normalized.startsWith('(')) {
+        return normalized === 'all' || normalized === profile.type;
+    }
+    if (!normalized.endsWith(')')) return false;
+
+    const feature = normalized.slice(1, -1).trim();
+    const match = /^(?:(min|max)-)?(width|height|orientation)\s*:\s*(.+)$/.exec(feature);
+    if (!match) return false;
+    const [, range, name, rawValue] = match;
+    if (name === 'orientation') return !range && profile.orientation === rawValue.trim();
+
+    const actual = profile[name];
+    const expectedValue = evaluateCssLength(rawValue, 'dp');
+    const expected = expectedValue && parseFloat(expectedValue);
+    if (actual === null || !Number.isFinite(expected)) return false;
+    if (range === 'min') return actual >= expected;
+    if (range === 'max') return actual <= expected;
+    return actual === expected;
+}
+
+function findNextCssBrace(input, start, target) {
+    let quote = null;
+    let inComment = false;
+
+    for (let i = start; i < input.length; i++) {
+        const ch = input[i];
+        const next = input[i + 1];
+        if (inComment) {
+            if (ch === '*' && next === '/') {
+                inComment = false;
+                i++;
+            }
+        } else if (!quote && ch === '/' && next === '*') {
+            inComment = true;
+            i++;
+        } else if (quote) {
+            if (ch === quote && input[i - 1] !== '\\') quote = null;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === target) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+function findMatchingCssBrace(input, open) {
+    let depth = 1;
+    let quote = null;
+    let inComment = false;
+
+    for (let i = open + 1; i < input.length; i++) {
+        const ch = input[i];
+        const next = input[i + 1];
+        if (inComment) {
+            if (ch === '*' && next === '/') {
+                inComment = false;
+                i++;
+            }
+        } else if (!quote && ch === '/' && next === '*') {
+            inComment = true;
+            i++;
+        } else if (quote) {
+            if (ch === quote && input[i - 1] !== '\\') quote = null;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === '{') {
+            depth++;
+        } else if (ch === '}' && --depth === 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+function selectorSpecificity(selector) {
+    const withoutAttributes = String(selector).replace(/\[[^\]]*\]/g, ' ');
+    const ids = (withoutAttributes.match(/#[\w-]+/g) || []).length;
+    const classes = (withoutAttributes.match(/\.[\w-]+/g) || []).length;
+    const attributes = (String(selector).match(/\[[^\]]*\]/g) || []).length;
+    const pseudoClasses = (withoutAttributes.match(/:(?!:)[\w-]+(?:\([^)]*\))?/g) || []).length;
+    const elements = (withoutAttributes
+        .replace(/#[\w-]+|\.[\w-]+|::?[\w-]+(?:\([^)]*\))?/g, ' ')
+        .match(/(^|[\s>+~])([a-z][\w-]*)/gi) || []).length;
+    const pseudoElements = (withoutAttributes.match(/::[\w-]+/g) || []).length;
+    return [ids, classes + attributes + pseudoClasses, elements + pseudoElements];
+}
+
+function resolveCssVariables(value, variables) {
+    let result = String(value || '');
+
+    for (let pass = 0; pass < 20; pass++) {
+        const start = result.indexOf('var(');
+        if (start === -1) break;
+
+        const open = start + 3;
+        const close = findMatchingParenthesis(result, open);
+        if (close === -1) break;
+
+        const parts = splitCssSegments(result.slice(open + 1, close), ',');
+        const name = (parts.shift() || '').trim().toLowerCase();
+        const replacement = Object.prototype.hasOwnProperty.call(variables, name)
+            ? variables[name]
+            : parts.join(', ').trim();
+        result = `${result.slice(0, start)}${replacement}${result.slice(close + 1)}`;
+    }
+
+    return result.trim();
+}
+
+function findMatchingParenthesis(input, open) {
+    let depth = 1;
+    let quote = null;
+
+    for (let i = open + 1; i < input.length; i++) {
+        const ch = input[i];
+        if (quote) {
+            if (ch === quote && input[i - 1] !== '\\') quote = null;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === '(') {
+            depth++;
+        } else if (ch === ')' && --depth === 0) {
+            return i;
+        }
+    }
+
+    return -1;
 }
 
 function normalizeStyleValue(value) {
@@ -191,8 +469,161 @@ function hslToRgb(hue, saturation, lightness) {
     });
 }
 
+function tokenizeCssMath(value) {
+    const tokens = [];
+    const input = String(value);
+    let cursor = 0;
+
+    while (cursor < input.length) {
+        const rest = input.slice(cursor);
+        const whitespace = /^\s+/.exec(rest);
+        if (whitespace) {
+            cursor += whitespace[0].length;
+            continue;
+        }
+
+        const number = /^(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?/i.exec(rest);
+        if (number) {
+            cursor += number[0].length;
+            const unit = /^(px|dp|sp|rem|em|%)/i.exec(input.slice(cursor));
+            if (unit) cursor += unit[0].length;
+            tokens.push({ type: 'number', value: parseFloat(number[0]), unit: unit?.[0].toLowerCase() || '' });
+            continue;
+        }
+
+        const identifier = /^(calc|min|max|clamp)\b/i.exec(rest);
+        if (identifier) {
+            tokens.push({ type: 'function', value: identifier[0].toLowerCase() });
+            cursor += identifier[0].length;
+            continue;
+        }
+
+        const symbol = rest[0];
+        if ('+-*/(),'.includes(symbol)) {
+            tokens.push({ type: symbol, value: symbol });
+            cursor++;
+            continue;
+        }
+        return null;
+    }
+
+    return tokens;
+}
+
+function evaluateCssLength(value, outputUnit = 'dp') {
+    const tokens = tokenizeCssMath(value);
+    if (!tokens) return null;
+    let cursor = 0;
+
+    function peek(type) {
+        return tokens[cursor]?.type === type;
+    }
+
+    function take(type) {
+        if (!peek(type)) throw new Error('Unexpected CSS math token.');
+        return tokens[cursor++];
+    }
+
+    function normalizeNumber(token) {
+        if (!token.unit) return { value: token.value, kind: 'number' };
+        if (token.unit === '%') return { value: token.value, kind: 'percent' };
+        const multiplier = ['em', 'rem'].includes(token.unit) ? 16 : 1;
+        return { value: token.value * multiplier, kind: 'length' };
+    }
+
+    function compatible(left, right) {
+        if (left.kind === right.kind) return [left, right];
+        if (left.kind === 'number' && left.value === 0) return [{ value: 0, kind: right.kind }, right];
+        if (right.kind === 'number' && right.value === 0) return [left, { value: 0, kind: left.kind }];
+        throw new Error('Incompatible CSS math dimensions.');
+    }
+
+    function parsePrimary() {
+        if (peek('+') || peek('-')) {
+            const sign = take(tokens[cursor].type).type === '-' ? -1 : 1;
+            const result = parsePrimary();
+            return { ...result, value: result.value * sign };
+        }
+        if (peek('number')) return normalizeNumber(take('number'));
+        if (peek('(')) {
+            take('(');
+            const result = parseExpression();
+            take(')');
+            return result;
+        }
+        if (peek('function')) {
+            const name = take('function').value;
+            take('(');
+            if (name === 'calc') {
+                const result = parseExpression();
+                take(')');
+                return result;
+            }
+
+            const args = [parseExpression()];
+            while (peek(',')) {
+                take(',');
+                args.push(parseExpression());
+            }
+            take(')');
+            if ((name === 'clamp' && args.length !== 3) || (name !== 'clamp' && args.length < 1)) {
+                throw new Error('Invalid CSS math arguments.');
+            }
+            const normalized = args.slice(1).reduce((items, item) => {
+                const [first, current] = compatible(items[0], item);
+                items[0] = first;
+                items.push(current);
+                return items;
+            }, [args[0]]);
+            if (name === 'min') return normalized.reduce((best, item) => item.value < best.value ? item : best);
+            if (name === 'max') return normalized.reduce((best, item) => item.value > best.value ? item : best);
+            return {
+                value: Math.max(normalized[0].value, Math.min(normalized[1].value, normalized[2].value)),
+                kind: normalized[0].kind,
+            };
+        }
+        throw new Error('Expected a CSS math value.');
+    }
+
+    function parseProduct() {
+        let result = parsePrimary();
+        while (peek('*') || peek('/')) {
+            const operator = take(tokens[cursor].type).type;
+            const right = parsePrimary();
+            if (operator === '*') {
+                if (result.kind === 'number') result = { value: result.value * right.value, kind: right.kind };
+                else if (right.kind === 'number') result = { value: result.value * right.value, kind: result.kind };
+                else throw new Error('CSS lengths cannot be multiplied together.');
+            } else {
+                if (right.kind !== 'number' || right.value === 0) throw new Error('CSS lengths require a unitless nonzero divisor.');
+                result = { value: result.value / right.value, kind: result.kind };
+            }
+        }
+        return result;
+    }
+
+    function parseExpression() {
+        let result = parseProduct();
+        while (peek('+') || peek('-')) {
+            const operator = take(tokens[cursor].type).type;
+            const [left, right] = compatible(result, parseProduct());
+            result = { value: operator === '+' ? left.value + right.value : left.value - right.value, kind: left.kind };
+        }
+        return result;
+    }
+
+    try {
+        const result = parseExpression();
+        if (cursor !== tokens.length || result.kind === 'percent') return null;
+        return `${trimNumber(result.value)}${outputUnit}`;
+    } catch {
+        return null;
+    }
+}
+
 function pxToDp(val) {
     const value = String(val).trim();
+    if (/^(calc|min|max|clamp)\(/i.test(value)) return evaluateCssLength(value, 'dp');
     if (/^-?\d+(\.\d+)?$/.test(value)) return `${value}dp`;
     return value
         .replace(/(-?\d+\.?\d*)\s*px/g, (_, n) => `${n}dp`)
@@ -202,6 +633,7 @@ function pxToDp(val) {
 
 function pxToSp(val) {
     const value = String(val).trim();
+    if (/^(calc|min|max|clamp)\(/i.test(value)) return evaluateCssLength(value, 'sp');
     if (/^-?\d+(\.\d+)?$/.test(value)) return `${value}sp`;
     return value
         .replace(/(-?\d+\.?\d*)\s*px/g, (_, n) => `${n}sp`)
@@ -217,12 +649,13 @@ function cssSizeToAndroid(val) {
     const size = normalizeStyleValue(val);
     if (size === '100%') return 'match_parent';
     if (size === 'auto') return 'wrap_content';
+    if (/^(calc|min|max|clamp)\(/i.test(size)) return evaluateCssLength(size, 'dp');
     if (/^\d+(\.\d+)?$/.test(size)) return `${size}dp`;
     return pxToDp(size);
 }
 
 function expandBoxValues(val) {
-    const parts = String(val).trim().split(/\s+/).filter(Boolean);
+    const parts = splitCssTokens(val);
     if (parts.length === 0) return null;
 
     const [top, right = top, bottom = top, left = right] = parts;
@@ -460,10 +893,12 @@ function parseTransform(val) {
 }
 
 module.exports = {
-    parseStyle, normalizeStyleValue, escapeXmlAttribute, sanitizeResourceName,
+    parseStyle, parseStyleDeclarations, parseCssStylesheet, normalizeMediaProfile, matchesMediaQuery,
+    selectorSpecificity, resolveCssVariables,
+    normalizeStyleValue, escapeXmlAttribute, sanitizeResourceName,
     makeUniqueResourceName,
     resourceNameFromPath,
-    sanitizeColor, pxToDp, pxToSp, cssSizeToAndroid, expandBoxValues,
+    sanitizeColor, evaluateCssLength, pxToDp, pxToSp, cssSizeToAndroid, expandBoxValues,
     splitCssTokens, parseBorder, extractBackgroundColor, parseBorderRadius, radiusToKey, uniformRadiusValue,
     parseBoxShadow, parseLinearGradient, parseTransform,
     generateShapeDrawable, generateGradientDrawable,

@@ -2,6 +2,8 @@
 
 **ShiftLayout** converts HTML + CSS into production-ready Android XML layouts. Write your UI in HTML, get back ConstraintLayout, CardView, MaterialButton, TextInputLayout, BottomNavigationView, shape drawables, gradient drawables, and menu files - ready to drop into Android Studio.
 
+See [ROADMAP.md](ROADMAP.md) for completed capabilities, upcoming features, and deferred work.
+
 ---
 
 ## Installation
@@ -63,7 +65,34 @@ const sculptor = new ShiftLayout({
 | `arrays` | `{ [filename]: string }` | `res/values/` per-select string arrays |
 | `values` | `{ [filename]: string }` | Combined `res/values/` files such as `arrays.xml` |
 | `resources` | `{ drawables, menus, values }` | Grouped Android resource files |
-| `assets` | `{ images: Array<{ source, resource }> }` | External image manifest |
+| `assets` | `{ images: Array<{ source, resource, density }> }` | External image manifest |
+| `warnings` | `Array<{ severity, code, message, element, property, value }>` | Structured conversion diagnostics |
+
+### Diagnostics
+
+Conversion continues when CSS cannot be represented exactly, and the result
+reports the issue through `warnings`:
+
+```javascript
+const { layout, warnings } = sculptor.convert(html);
+
+for (const warning of warnings) {
+    console.warn(warning.code, warning.element, warning.property, warning.message);
+}
+```
+
+Current warning codes include:
+
+| Code | Meaning |
+|---|---|
+| `unsupported-css-property` | The property has no converter mapping |
+| `unsupported-css-value` | The property is recognized but its value cannot be represented |
+| `approximated-css` | Android output is useful but not browser-equivalent |
+| `invalid-css-selector` | A stylesheet selector could not be matched |
+| `missing-stylesheet` | A linked stylesheet was not supplied through `convert()` options |
+
+Warnings are deduplicated and include element, property, and value context when
+available. CSS custom properties do not produce unsupported-property warnings.
 
 ---
 
@@ -127,6 +156,70 @@ const sculptor = new ShiftLayout({
 ---
 
 ## CSS Property Reference
+
+### Embedded Stylesheets
+
+ShiftLayout reads CSS from `<style>` elements as well as inline `style` attributes.
+Tag, class, ID, attribute, grouped, and descendant selectors are supported. The
+cascade respects specificity, source order, inheritance for text properties,
+and `!important`. CSS custom properties are inherited and resolved through
+`var()`, including fallback values.
+
+```html
+<style>
+    :root { --brand: #336699; }
+    .card p { color: var(--brand); }
+    #status { font-weight: bold; }
+</style>
+
+<section class="card">
+    <p id="status">Ready</p>
+</section>
+```
+
+External stylesheet URLs are not loaded automatically. Supply already-loaded CSS
+by exact linked `href` using the second `convert()` argument:
+
+```javascript
+const result = sculptor.convert(`
+    <link rel="stylesheet" href="theme.css">
+    <p class="status">Ready</p>
+`, {
+    stylesheets: {
+        'theme.css': '.status { color: #336699; font-weight: bold; }',
+    },
+});
+```
+
+`stylesheets` accepts an object or `Map` whose values are CSS strings. Linked
+stylesheets and `<style>` elements follow document cascade order. Unmatched links
+are ignored, keeping conversion deterministic and free of hidden file or network
+access.
+
+### Media Query Profiles
+
+Pass a target media profile to activate matching `@media` rules:
+
+```javascript
+const result = sculptor.convert(html, {
+    media: {
+        type: 'screen',
+        width: 800,
+        height: 600,
+        orientation: 'landscape',
+    },
+});
+```
+
+`width` and `height` accept non-negative numbers or compatible CSS lengths such
+as `48rem`. Orientation is derived from width and height when omitted. Supported
+conditions include `min-width`, `max-width`, exact `width`, their height
+equivalents, `orientation`, `screen`, `print`, `all`, `not`, `only`, `and`, and
+comma-separated alternatives. Nested media rules are combined and retain normal
+stylesheet source order and specificity.
+
+When `media` is omitted, conditional rules remain inactive. This avoids silently
+assuming a viewport that may not match the Android target.
 
 ### Colors
 
@@ -197,17 +290,81 @@ Supported font families: Roboto, Open Sans, Lato, Ubuntu -> `sans-serif`; Georgi
 | `margin: 8px` | `android:layout_margin="8dp"` |
 | `margin-top/bottom/left/right` | Individual `android:layout_marginTop` etc. |
 
+### Computed Lengths
+
+Compatible `calc()`, `min()`, `max()`, and `clamp()` expressions are evaluated
+before Android XML is generated.
+
+```css
+width: calc(100px + 2rem);          /* 132dp */
+padding: min(24px, 2rem);           /* 24dp */
+font-size: clamp(14px, 1.25rem, 24px); /* 20sp */
+left: calc((8px + 1rem) / 2);       /* 12dp */
+```
+
+The evaluator supports parentheses, unary signs, addition, subtraction,
+multiplication by unitless numbers, division by nonzero unitless numbers, and
+nested math functions. Compatible `px`, `dp`, `sp`, `em`, and `rem` lengths are
+normalized to Android units. Expressions that require a browser viewport or
+parent measurement, such as `calc(100% - 16px)`, are left unresolved and are not
+emitted as invalid Android dimensions.
+
 ### Flexbox
 
 | CSS | Android output |
 |---|---|
+| `display: flex` | Horizontal `LinearLayout` for simple layouts |
 | `flex-direction: row` | `android:orientation="horizontal"` |
 | `flex-direction: column` | `android:orientation="vertical"` (default) |
+| `flex-direction: row-reverse/column-reverse` | `FlexboxLayout` with `app:flexDirection` |
+| `flex-wrap: wrap/wrap-reverse` | `FlexboxLayout` with `app:flexWrap` |
 | `justify-content: center` | `android:gravity="center_horizontal"` (row) or `"center_vertical"` (column) |
 | `justify-content: flex-end` | `android:gravity="end"` or `"bottom"` |
+| `justify-content: space-between/space-around/space-evenly` | `FlexboxLayout` distribution |
 | `align-items: center` | `android:gravity="center_vertical"` (row) or `"center_horizontal"` (column) |
 | `align-items: stretch` | `android:gravity="fill"` |
-| `gap: 12px` | `android:dividerPadding="12dp"` + `android:showDividers="middle"` |
+| `align-content` | `FlexboxLayout` line alignment |
+| `order` | Stable XML ordering plus `app:layout_order` |
+| `flex-grow` / `flex-shrink` | `app:layout_flexGrow` / `app:layout_flexShrink` |
+| `flex-basis` | Percentage basis or main-axis width/height |
+| `flex` | Expanded into grow, shrink, and basis attributes |
+| `align-self` | `app:layout_alignSelf` |
+| `gap: 12px` | Simple `LinearLayout` approximation using divider attributes |
+
+Advanced flex features emit Google `FlexboxLayout`. Android projects using
+those generated layouts need this dependency:
+
+```gradle
+implementation 'com.google.android.flexbox:flexbox:3.0.0'
+```
+
+Simple row and column layouts continue to use `LinearLayout` and do not require
+the Flexbox dependency. Gap values are not currently emitted for advanced,
+wrapping `FlexboxLayout` containers.
+
+### Grid
+
+CSS Grid containers are converted to Android `GridLayout`.
+
+| CSS | Android output |
+|---|---|
+| `display: grid/inline-grid` | `GridLayout` |
+| `grid-template-columns` | Inferred `android:columnCount` |
+| `grid-template-rows` | Inferred `android:rowCount` |
+| Numeric `repeat()` | Expanded track count |
+| `grid-auto-flow: row/column` | Horizontal or vertical automatic placement |
+| `grid-column` / `grid-row` | Zero-based Android cell index and span |
+| `grid-area: row / column / row-end / column-end` | Combined row and column placement |
+| `justify-items` / `align-items` / `place-items` | Child `android:layout_gravity` |
+| `justify-self` / `align-self` / `place-self` | Per-child gravity override |
+| `gap`, `row-gap`, `column-gap` | Half-gap margins on adjacent grid items |
+| Fractional tracks (`fr`) | Equal Android row or column weights |
+
+This is an Android approximation, not a browser layout engine. Named grid lines
+and areas, negative line numbers, dense packing, `auto-fit`, `auto-fill`, and
+exact `minmax()` or unequal fractional track sizing are not currently resolved.
+The generated layout preserves numeric track counts, placement, spans, order,
+alignment, and practical spacing.
 
 ### Visibility
 
@@ -223,8 +380,17 @@ Supported font families: Roboto, Open Sans, Lato, Ubuntu -> `sans-serif`; Georgi
 |---|---|
 | `vertical-align: center` | Top + bottom constraint (centered vertically) |
 | `bottom: 0` | Bottom constraint |
-| `position: absolute` + `top/left/right/bottom` | Parent becomes `FrameLayout`; child gets `android:layout_gravity` + margins |
+| Root `position: absolute/fixed` | Parent-edge ConstraintLayout anchors and margins |
+| Nested `position: absolute/fixed` | Parent becomes `FrameLayout`; child gets gravity and edge margins |
+| `position: relative` + offsets | `android:translationX` / `android:translationY` |
+| Opposing edges such as `left: 0; right: 0` | Match/stretch across the available parent axis |
+| `inset` shorthand | Expanded to top, right, bottom, and left edges |
+| Paired `margin: auto` | Horizontal or vertical centering without invalid Android dimensions |
 | `overflow-y: scroll` | Element wrapped in `ScrollView` |
+
+Nested positioned children inside generated cards use a `FrameLayout` card
+content container. Percentage offsets and sticky positioning are not currently
+converted because Android XML has no direct static equivalent.
 
 ### Visual Effects
 
@@ -305,13 +471,65 @@ Generates: parent becomes `FrameLayout`; FAB div uses `android:layout_gravity="e
 
 ## Writing Files
 
-Run the example writer to generate an Android-style output tree:
+Use the exported resource writer to create an Android-style output tree and copy
+local bitmap assets:
+
+```javascript
+const ShiftLayout = require('shiftlayout');
+
+const converter = new ShiftLayout();
+const result = converter.convert(html);
+const report = ShiftLayout.writeResources('android-output', result, {
+    baseDir: __dirname,
+    layoutName: 'activity_main',
+    defaultImageDensity: 'xhdpi',
+});
+```
+
+`baseDir` is the containment root for local image sources. Files that resolve
+outside it, do not exist, or use unsupported formats are skipped and reported.
+PNG, JPEG, WebP, and GIF files are copied. Supported SVG files are converted to
+Android VectorDrawable XML. Remote HTTP, data, and blob URLs stay in the image
+manifest without network access.
+
+Image density can come from `data-android-density`, a density directory such as
+`xhdpi/`, an `@2x` filename suffix, `imageDensities[source]`, or
+`defaultImageDensity`. The writer uses Android directories such as
+`res/drawable-hdpi` and `res/drawable-xhdpi`; images without a density use
+`res/drawable`.
+
+The returned report lists written files, copied images, skipped images, and
+asset warnings. The same asset summary is written to
+`diagnostics/assets.json`.
+
+### SVG Conversion
+
+The resource writer converts this SVG subset:
+
+- `<path>` data
+- Rectangles, including rounded rectangles
+- Circles and ellipses
+- Lines, polylines, and polygons
+- Nested groups
+- Fill and stroke colors, widths, opacity, line caps, joins, and fill rules
+- Basic `translate()`, `scale()`, and `rotate()` transforms
+- Nonzero `viewBox` origins
+
+SVG scripts, external images, `<use>`, `foreignObject`, gradients, patterns,
+masks, filters, clipping references, text, dashed strokes, and matrix/skew
+transforms are not silently embedded. They are omitted and reported through the
+asset write report. Converted vectors are written to `res/drawable/<name>.xml`;
+drawable resource-name conflicts are reported instead of overwritten.
+
+Run the included example:
 
 ```bash
 node examples/write-android-resources.js
 ```
 
-It writes `res/layout`, `res/drawable`, `res/menu`, `res/values`, and an image asset manifest under `examples/android-output/`.
+It writes `res/layout`, `res/drawable`, `res/menu`, `res/values`, an image asset
+manifest, and structured conversion/asset diagnostics under
+`examples/android-output/`.
 
 ---
 

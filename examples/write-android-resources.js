@@ -18,23 +18,9 @@ const converter = new ShiftLayout({ prefix: 'demo' });
 const result = converter.convert(html);
 
 fs.rmSync(outputDir, { recursive: true, force: true });
+const report = ShiftLayout.writeResources(outputDir, result, {
+    baseDir: __dirname,
+    layoutName: 'activity_main',
+});
 
-writeFile('res/layout/activity_main.xml', result.layout);
-writeResourceMap('res/drawable', result.drawables);
-writeResourceMap('res/menu', result.menus);
-writeResourceMap('res/values', result.values);
-writeFile('assets/images.json', JSON.stringify(result.assets.images, null, 2));
-
-console.log(`Wrote Android resources to ${outputDir}`);
-
-function writeResourceMap(baseDir, files) {
-    for (const [filename, contents] of Object.entries(files)) {
-        writeFile(path.join(baseDir, filename), contents);
-    }
-}
-
-function writeFile(relativePath, contents) {
-    const target = path.join(outputDir, relativePath);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, contents, 'utf8');
-}
+console.log(`Wrote ${report.writtenFiles.length} Android resource files to ${outputDir}`);

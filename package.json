@@ -13,6 +13,7 @@
     "src/",
     "examples/write-android-resources.js",
     "README.md",
+    "ROADMAP.md",
     "CHANGELOG.md"
   ],
   "keywords": [

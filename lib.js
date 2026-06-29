@@ -1,1 +1,1 @@
-module.exports = require('./src/ShiftLayout');
+module.exports = require('./index');
