@@ -2,10 +2,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const ShiftLayout = require('..');
 const {
-    parseStyle, parseStyleDeclarations, parseCssStylesheet, normalizeMediaProfile, matchesMediaQuery, selectorSpecificity,
+    parseStyle, parseStyleDeclarations, parseCssStylesheet, parseFontFaces, normalizeMediaProfile, matchesMediaQuery, selectorSpecificity,
     parseBorder, parseBorderRadius, parseBoxShadow, buildXmlString,
     evaluateCssLength, pxToDp, pxToSp,
     resourceNameFromPath, sanitizeColor, extractBackgroundColor,
@@ -17,6 +18,13 @@ assert.deepEqual(parseStyleDeclarations('color: red !important; width: 10px'), [
     { property: 'width', value: '10px', important: false },
 ]);
 assert.equal(parseCssStylesheet('p, .note { color: red; }').length, 1);
+assert.deepEqual(parseFontFaces(`
+    @font-face { font-family: "Local Sans"; src: url("fonts/local.ttf") format("truetype"); font-weight: 400; }
+    @media screen { @font-face { font-family: Bold; src: url(fonts/bold.otf); font-weight: bold; } }
+`), [
+    { 'font-family': '"Local Sans"', src: 'url("fonts/local.ttf") format("truetype")', 'font-weight': '400' },
+    { 'font-family': 'Bold', src: 'url(fonts/bold.otf)', 'font-weight': 'bold' },
+]);
 assert.deepEqual(selectorSpecificity('#screen .note p'), [1, 1, 1]);
 
 const converter = new ShiftLayout({ prefix: 'test' });
@@ -151,6 +159,51 @@ assert.match(forms.layout, /android:id="@\+id\/notes"[\s\S]*android:hint="Intern
 assert.match(forms.layout, /android:id="@\+id\/notes"[\s\S]*android:minLines="5"/);
 assert.match(forms.layout, /android:id="@\+id\/notes"[\s\S]*android:ems="42"/);
 assert.match(forms.layout, /android:id="@\+id\/notes"[\s\S]*<requestFocus \/>/);
+
+const formMetadata = new ShiftLayout().convert(`
+    <form id="signup_form" action="/signup" method="post">
+        <fieldset id="credentials_group">
+            <legend>Credentials</legend>
+            <input id="username" name="username" required minlength="3" maxlength="24"
+                pattern="[a-z]+" data-helper-text="Use lowercase letters">
+            <p id="email_help">We never share your email.</p>
+            <p id="email_error">Enter a valid email address.</p>
+            <input id="signup_email" name="email" type="email" required
+                aria-describedby="email_help" aria-errormessage="email_error" aria-invalid="true">
+            <select id="signup_plan" name="plan" required><option>Starter</option></select>
+        </fieldset>
+    </form>
+`);
+assert.match(formMetadata.layout, /android:id="@\+id\/username"[\s\S]*app:helperTextEnabled="true"[\s\S]*app:helperText="Use lowercase letters"/);
+assert.match(formMetadata.layout, /android:id="@\+id\/signup_email"[\s\S]*app:errorEnabled="true"/);
+assert.match(formMetadata.layout, /android:id="@\+id\/signup_email"[\s\S]*app:errorContentDescription="Enter a valid email address\."/);
+assert.match(formMetadata.layout, /android:id="@\+id\/signup_email"[\s\S]*app:helperTextTextColor="#B00020"/);
+assert.deepEqual(formMetadata.forms, [{
+    id: 'signup_form',
+    target: '/signup',
+    method: 'post',
+    groups: [{
+        id: 'credentials_group',
+        label: 'Credentials',
+        fields: ['username', 'signup_email', 'signup_plan'],
+    }],
+    fields: [
+        {
+            id: 'username', name: 'username', type: 'text', required: true, disabled: false, readOnly: false,
+            invalid: false, constraints: { minlength: '3', maxlength: '24', pattern: '[a-z]+' },
+            helperText: 'Use lowercase letters', errorText: null, group: 'credentials_group',
+        },
+        {
+            id: 'signup_email', name: 'email', type: 'email', required: true, disabled: false, readOnly: false,
+            invalid: true, constraints: {}, helperText: 'We never share your email.',
+            errorText: 'Enter a valid email address.', group: 'credentials_group',
+        },
+        {
+            id: 'signup_plan', name: 'plan', type: 'select', required: true, disabled: false, readOnly: false,
+            invalid: false, constraints: {}, helperText: null, errorText: null, group: 'credentials_group',
+        },
+    ],
+}]);
 
 assert.equal(sanitizeColor('rgb(300, -1, 12)'), null);
 assert.equal(sanitizeColor('rgb(300, 0, 12)'), '#FF000C');
@@ -503,6 +556,18 @@ assert.ok(!diagnostics.warnings.some(warning => warning.property === '--brand'))
 
 const cleanDiagnostics = diagnosticConverter.convert('<p style="color: #123456;">Clean</p>');
 assert.deepEqual(cleanDiagnostics.warnings, []);
+assert.doesNotThrow(() => diagnosticConverter.convert('<p style="color: #123456;">Clean</p>', { strict: true }));
+assert.throws(
+    () => diagnosticConverter.convert('<p style="transition: all 200ms;">Strict</p>', { strict: true }),
+    error => error.name === 'ShiftLayoutConversionError'
+        && /strict conversion failed with 1 warning/.test(error.message)
+        && error.warnings.length === 1
+        && error.warnings[0].code === 'unsupported-css-property'
+);
+assert.throws(
+    () => diagnosticConverter.convert('<p>Invalid strict option</p>', { strict: 'yes' }),
+    /strict must be a boolean/
+);
 
 const assetTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'shiftlayout-assets-'));
 try {
@@ -525,9 +590,20 @@ try {
             <image href="https://example.com/image.png" width="24" height="24" />
         </svg>
     `, 'utf8');
+    fs.mkdirSync(path.join(assetBase, 'fonts'), { recursive: true });
+    fs.writeFileSync(path.join(assetBase, 'fonts', 'local.ttf'), Buffer.from('test-font'));
+    fs.writeFileSync(path.join(assetBase, 'fonts', 'mapped.otf'), Buffer.from('mapped-font'));
     fs.writeFileSync(path.join(assetTestRoot, 'outside.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
 
     const assetResult = new ShiftLayout().convert(`
+        <style>
+            @font-face { font-family: "Local Sans"; src: url("fonts/local.ttf"); font-weight: 400; }
+            @font-face { font-family: "Remote Sans"; src: url("https://cdn.example.com/remote.woff2"); font-style: italic; }
+            .local-font { font-family: "Local Sans", sans-serif; }
+            .remote-font { font-family: "Remote Sans", serif; }
+        </style>
+        <p id="local_font" class="local-font">Local</p>
+        <p id="remote_font" class="remote-font">Remote fallback</p>
         <img id="logo_one" src="assets/xhdpi/logo@2x.png?v=1" alt="Logo">
         <img id="logo_two" src="assets/xhdpi/logo@2x.png?v=1" alt="Logo again">
         <img id="photo" src="/assets/photo.jpg" data-android-density="hdpi" alt="Photo">
@@ -535,8 +611,15 @@ try {
         <img id="unsupported_vector" src="assets/unsupported.svg" alt="Unsupported vector">
         <img id="outside" src="../outside.png" alt="Outside">
         <img id="remote" src="https://example.com/remote.png" alt="Remote">
-    `);
+    `, {
+        fontSources: { 'https://cdn.example.com/remote.woff2': 'fonts/mapped.otf' },
+    });
 
+    assert.match(assetResult.layout, /android:id="@\+id\/local_font"[\s\S]*android:fontFamily="@font\/sl_font_local_sans"/);
+    assert.match(assetResult.layout, /android:id="@\+id\/remote_font"[\s\S]*android:fontFamily="@font\/sl_font_remote_sans"/);
+    assert.match(assetResult.fonts['sl_font_local_sans.xml'], /android:font="@font\/sl_font_local_sans_400_normal"/);
+    assert.match(assetResult.fonts['sl_font_remote_sans.xml'], /android:fontStyle="italic"/);
+    assert.equal(assetResult.assets.fonts.length, 2);
     assert.match(assetResult.layout, /android:id="@\+id\/logo_one"[\s\S]*android:src="@drawable\/logo"/);
     assert.match(assetResult.layout, /android:id="@\+id\/logo_two"[\s\S]*android:src="@drawable\/logo"/);
     assert.equal(assetResult.assets.images.filter(image => image.source.includes('logo@2x')).length, 1);
@@ -562,9 +645,18 @@ try {
     assert.match(vectorXml, /android:fillType="evenOdd"/);
     assert.match(vectorXml, /android:fillAlpha="0\.5"/);
     assert.ok(fs.existsSync(path.join(assetOutput, 'assets', 'images.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'assets', 'fonts.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'res', 'font', 'sl_font_local_sans.xml')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'res', 'font', 'sl_font_local_sans_400_normal.ttf')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'res', 'font', 'sl_font_remote_sans_400_italic.otf')));
     assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'warnings.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'interactions.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'forms.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'media.json')));
+    assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'extracted-resources.json')));
     assert.ok(fs.existsSync(path.join(assetOutput, 'diagnostics', 'assets.json')));
     assert.equal(writeReport.copiedImages.length, 3);
+    assert.equal(writeReport.copiedFonts.length, 2);
     assert.ok(writeReport.copiedImages.some(image => image.resource === 'vector' && image.format === 'vector'));
     assert.ok(writeReport.skippedImages.some(image => image.source.includes('remote.png') && image.reason === 'remote'));
     assert.ok(writeReport.warnings.some(warning => warning.code === 'unsupported-svg-content' && warning.source.includes('unsupported.svg')));
@@ -575,6 +667,46 @@ try {
 }
 
 assert.equal(resourceNameFromPath('https://cdn.example.com/images/123 logo.webp?size=2#hash'), 'placeholder_123_logo');
+
+const embeddedMediaConverter = new ShiftLayout();
+const embeddedMedia = embeddedMediaConverter.convert(`
+    <video id="demo_video" src="media/demo.mp4" poster="media/poster.png" width="640" height="360"
+        controls autoplay loop muted preload="metadata" title="Demo video"><p>Video fallback</p></video>
+    <audio id="podcast" controls><source src="media/podcast.mp3" type="audio/mpeg">Audio fallback</audio>
+    <iframe id="guide" src="https://example.com/guide" srcdoc="<p>Inline</p>"
+        sandbox="allow-scripts" allow="fullscreen" title="Guide"></iframe>
+    <canvas id="chart" width="320" height="180">Chart fallback</canvas>
+    <embed id="document_embed" src="docs/guide.pdf" type="application/pdf" title="Guide PDF">
+    <object id="document_object" data="docs/terms.pdf" type="application/pdf">Terms document</object>
+`);
+assert.match(embeddedMedia.layout, /<VideoView[\s\S]*android:layout_width="640dp"[\s\S]*android:layout_height="360dp"[\s\S]*android:id="@\+id\/demo_video"/);
+assert.match(embeddedMedia.layout, /android:id="@\+id\/podcast"[\s\S]*android:tag="media\/podcast\.mp3"/);
+assert.match(embeddedMedia.layout, /<WebView[\s\S]*android:id="@\+id\/guide"[\s\S]*android:tag="https:\/\/example\.com\/guide"/);
+assert.match(embeddedMedia.layout, /<View[\s\S]*android:layout_width="320dp"[\s\S]*android:layout_height="180dp"[\s\S]*android:id="@\+id\/chart"/);
+assert.match(embeddedMedia.layout, /android:id="@\+id\/document_embed"[\s\S]*android:tag="docs\/guide\.pdf"/);
+assert.match(embeddedMedia.layout, /android:id="@\+id\/document_object"[\s\S]*android:tag="docs\/terms\.pdf"/);
+assert.ok(!embeddedMedia.layout.includes('android:text="Video fallback"'));
+assert.deepEqual(embeddedMedia.media.find(item => item.id === 'demo_video'), {
+    kind: 'video', id: 'demo_video', source: 'media/demo.mp4', mimeType: null, title: 'Demo video',
+    fallbackText: 'Video fallback', controls: true, autoplay: true, loop: true, muted: true,
+    preload: 'metadata', poster: 'media/poster.png',
+});
+assert.deepEqual(embeddedMedia.media.find(item => item.id === 'podcast'), {
+    kind: 'audio', id: 'podcast', source: 'media/podcast.mp3', mimeType: 'audio/mpeg', title: null,
+    fallbackText: 'Audio fallback', controls: true, autoplay: false, loop: false, muted: false,
+    preload: null, poster: null,
+});
+assert.deepEqual(embeddedMedia.media.find(item => item.id === 'guide'), {
+    kind: 'iframe', id: 'guide', source: 'https://example.com/guide', mimeType: null, title: 'Guide',
+    fallbackText: null, sourceDocument: '<p>Inline</p>', sandbox: 'allow-scripts', allow: 'fullscreen',
+});
+assert.deepEqual(embeddedMedia.media.find(item => item.id === 'chart'), {
+    kind: 'canvas', id: 'chart', source: null, mimeType: null, title: null,
+    fallbackText: 'Chart fallback', width: '320', height: '180',
+});
+assert.equal(embeddedMedia.media.length, 6);
+embeddedMediaConverter.convert('<p>No embedded media</p>');
+assert.deepEqual(embeddedMediaConverter.media, []);
 
 const media = new ShiftLayout().convert(`
     <img id="logo" src="https://cdn.example.com/images/123 logo.webp?size=2#hash" width="320" height="180" aria-label="Company logo">
@@ -675,6 +807,10 @@ const navIds = new ShiftLayout().convert(`
 assert.match(navIds.menus['main_nav_menu.xml'], /android:id="@\+id\/nav_home"/);
 assert.match(navIds.menus['main_nav_menu.xml'], /android:id="@\+id\/nav_home_2"/);
 assert.match(navIds.menus['main_nav_menu.xml'], /android:id="@\+id\/nav_item_3"/);
+assert.match(navIds.drawables['ic_nav_1.xml'], /<vector/);
+assert.match(navIds.drawables['ic_nav_1.xml'], /android:width="24dp"/);
+assert.match(navIds.drawables['ic_nav_2.xml'], /<path/);
+assert.match(navIds.drawables['ic_nav_3.xml'], /android:pathData=/);
 
 const rangeInput = new ShiftLayout().convert(`
     <input id="volume" type="range" min="0" max="100" value="65" disabled>
@@ -775,6 +911,42 @@ assert.match(links.layout, /android:id="@\+id\/phone_link"[\s\S]*android:autoLin
 assert.match(links.layout, /android:id="@\+id\/route_link"[\s\S]*android:clickable="true"/);
 assert.match(links.layout, /android:id="@\+id\/route_link"[\s\S]*android:focusable="true"/);
 assert.match(links.layout, /android:id="@\+id\/route_link"[\s\S]*android:tag="\/settings"/);
+
+const interactionConverter = new ShiftLayout();
+const interactionResult = interactionConverter.convert(`
+    <form id="profile_form" action="/profiles" method="post">
+        <a id="docs_link" href="https://example.com/docs">Documentation</a>
+        <a id="email_support" href="mailto:support@example.com">Support</a>
+        <button id="save_button" type="submit">Save</button>
+        <input id="reset_button" type="reset">
+        <div id="menu_trigger" role="button" aria-label="Open menu"></div>
+    </form>
+    <nav id="account_nav">
+        <a href="/home">Home</a>
+        <a href="/profile">Profile</a>
+    </nav>
+`);
+assert.deepEqual(interactionResult.interactions.find(item => item.id === 'profile_form'), {
+    type: 'form', id: 'profile_form', target: '/profiles', method: 'post',
+});
+assert.deepEqual(interactionResult.interactions.find(item => item.id === 'docs_link'), {
+    type: 'link', id: 'docs_link', target: 'https://example.com/docs', action: 'open-url', label: 'Documentation',
+});
+assert.equal(interactionResult.interactions.find(item => item.id === 'email_support').action, 'send-email');
+assert.deepEqual(interactionResult.interactions.find(item => item.id === 'save_button'), {
+    type: 'button', id: 'save_button', action: 'submit', form: 'profile_form', label: 'Save',
+});
+assert.deepEqual(interactionResult.interactions.find(item => item.id === 'reset_button'), {
+    type: 'button', id: 'reset_button', action: 'reset', form: 'profile_form', label: 'Reset',
+});
+assert.deepEqual(interactionResult.interactions.find(item => item.id === 'menu_trigger'), {
+    type: 'button', id: 'menu_trigger', action: 'button', form: 'profile_form', label: 'Open menu',
+});
+assert.deepEqual(interactionResult.interactions.find(item => item.id === 'nav_home'), {
+    type: 'navigation', id: 'nav_home', containerId: 'account_nav', target: '/home', label: 'Home',
+});
+interactionConverter.convert('<p>No interactions</p>');
+assert.deepEqual(interactionConverter.interactions, []);
 
 const textTransforms = new ShiftLayout().convert(`
     <p id="shout" style="text-transform: uppercase;">Quiet launch</p>
@@ -912,6 +1084,42 @@ assert.equal(selects.resources.menus, selects.menus);
 assert.equal(selects.resources.drawables, selects.drawables);
 assert.ok(!selects.layout.includes('<option'));
 
+const extractedValues = new ShiftLayout({ extractResources: true }).convert(`
+    <p id="repeated_one" style="color: #123456; margin: 8px;">Repeated label</p>
+    <p id="repeated_two" style="color: #123456; margin: 8px;">Repeated label</p>
+`);
+assert.match(extractedValues.layout, /android:textColor="@color\/sl_color_123456"/);
+assert.match(extractedValues.layout, /android:layout_margin="@dimen\/sl_dimen_8dp"/);
+assert.match(extractedValues.layout, /android:text="@string\/sl_string_repeated_label"/);
+assert.match(extractedValues.values['colors.xml'], /<color name="sl_color_123456">#123456<\/color>/);
+assert.match(extractedValues.values['dimens.xml'], /<dimen name="sl_dimen_8dp">8dp<\/dimen>/);
+assert.match(extractedValues.values['strings.xml'], /<string name="sl_string_repeated_label">Repeated label<\/string>/);
+assert.deepEqual(extractedValues.extractedResources, {
+    colors: { sl_color_123456: '#123456' },
+    dimensions: { sl_dimen_8dp: '8dp' },
+    strings: { sl_string_repeated_label: 'Repeated label' },
+});
+assert.equal(extractedValues.resources.values, extractedValues.values);
+
+const selectiveExtraction = new ShiftLayout({
+    extractResources: { colors: true, minOccurrences: 2 },
+}).convert('<p style="color: red; margin: 4px;">Same</p><p style="color: red; margin: 4px;">Same</p>');
+assert.ok(selectiveExtraction.values['colors.xml']);
+assert.equal(selectiveExtraction.values['dimens.xml'], undefined);
+assert.equal(selectiveExtraction.values['strings.xml'], undefined);
+assert.deepEqual(selectiveExtraction.extractedResources.dimensions, {});
+assert.deepEqual(selectiveExtraction.extractedResources.strings, {});
+
+const extractionThreshold = new ShiftLayout({
+    extractResources: { strings: true, minOccurrences: 3 },
+}).convert('<p>Twice</p><p>Twice</p>');
+assert.equal(extractionThreshold.values['strings.xml'], undefined);
+assert.deepEqual(extractionThreshold.extractedResources.strings, {});
+assert.throws(() => new ShiftLayout({ extractResources: 'yes' }), /extractResources must be a boolean or configuration object/);
+assert.throws(() => new ShiftLayout({ extractResources: { colors: 'yes' } }), /extractResources\.colors must be a boolean/);
+assert.throws(() => new ShiftLayout({ extractResources: { minOccurrences: 0 } }), /positive integer/);
+assert.throws(() => new ShiftLayout({ extractResources: { unknown: true } }), /Unknown extractResources option/);
+
 const stylesheet = new ShiftLayout().convert(`
     <style>
         :root {
@@ -951,6 +1159,40 @@ assert.match(stylesheet.layout, /android:id="@\+id\/variable"[\s\S]*android:text
 assert.match(stylesheet.layout, /android:id="@\+id\/inherited"[\s\S]*android:textColor="#101010"/);
 assert.match(stylesheet.layout, /android:id="@\+id\/inherited"[\s\S]*android:fontFamily="serif"/);
 assert.ok(!stylesheet.layout.includes('<style'));
+
+const pseudoElements = new ShiftLayout().convert(`
+    <style>
+        :root { --marker: "High: "; }
+        p::before { content: "Low: "; }
+        #pseudo::before { content: var(--marker) !important; }
+        #pseudo::after { content: " " attr(data-state); font-weight: bold; }
+        #legacy:before { content: "Legacy: "; }
+        #hidden::before { content: "Hidden "; display: none; }
+        #pseudo_container::before { content: "Start"; color: red; font-weight: bold; margin: 4px; }
+        #pseudo_container::after { content: "End"; background-color: #123456; }
+        #unsupported_pseudo::after { content: url(icon.png); }
+        #pseudo_image::after { content: "Image label"; }
+        #normal_content { content: "Not generated"; }
+    </style>
+    <p id="pseudo" data-state="done">Ready</p>
+    <p id="legacy">Compatible</p>
+    <p id="hidden">Visible</p>
+    <div id="pseudo_container"><span>Middle</span></div>
+    <p id="unsupported_pseudo">Plain</p>
+    <img id="pseudo_image" src="image.png" alt="Image">
+    <p id="normal_content">Normal</p>
+`);
+assert.match(pseudoElements.layout, /android:id="@\+id\/pseudo"[\s\S]*android:text="High: Ready done"/);
+assert.match(pseudoElements.layout, /android:id="@\+id\/legacy"[\s\S]*android:text="Legacy: Compatible"/);
+assert.match(pseudoElements.layout, /android:id="@\+id\/hidden"[\s\S]*android:text="Visible"/);
+assert.ok(!pseudoElements.layout.includes('Hidden Visible'));
+assert.match(pseudoElements.layout, /android:id="@\+id\/pseudo_container"[\s\S]*<TextView[\s\S]*android:text="Start"[\s\S]*android:textColor="#FF0000"[\s\S]*android:textStyle="bold"[\s\S]*android:layout_margin="4dp"/);
+assert.match(pseudoElements.layout, /android:id="@\+id\/pseudo_container"[\s\S]*android:text="Middle"[\s\S]*android:text="End"[\s\S]*android:background="#123456"/);
+assert.ok(!pseudoElements.warnings.some(warning => warning.code === 'invalid-css-selector'));
+assert.ok(pseudoElements.warnings.some(warning => warning.code === 'approximated-css' && warning.element === 'p#pseudo::after' && warning.property === 'font-weight'));
+assert.ok(pseudoElements.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.element === 'p#unsupported_pseudo::after'));
+assert.ok(pseudoElements.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.element === 'img#pseudo_image::after'));
+assert.ok(pseudoElements.warnings.some(warning => warning.code === 'unsupported-css-value' && warning.element === 'p#normal_content' && warning.property === 'content'));
 
 const linkedStylesheets = new ShiftLayout().convert(`
     <style>
@@ -995,6 +1237,158 @@ assert.throws(
 assert.throws(
     () => new ShiftLayout().convert('<p>Invalid</p>', { stylesheets: { 'theme.css': 42 } }),
     /must be provided as a CSS string/
+);
+
+const customElements = new ShiftLayout({
+    customElements: {
+        'app-card': 'LinearLayout',
+        'status-badge': 'TextView',
+        'user-avatar': 'com.example.views.AvatarView',
+    },
+}).convert(`
+    <app-card id="account_card" style="flex-direction: row;">
+        <status-badge id="account_status">Ready <strong>now</strong></status-badge>
+        <user-avatar id="account_avatar"></user-avatar>
+    </app-card>
+    <unknown-widget id="unknown"></unknown-widget>
+`);
+assert.match(customElements.layout, /<LinearLayout[\s\S]*android:id="@\+id\/account_card"[\s\S]*android:orientation="horizontal"/);
+assert.match(customElements.layout, /<TextView[\s\S]*android:id="@\+id\/account_status"[\s\S]*android:text="Ready now"/);
+assert.match(customElements.layout, /<com\.example\.views\.AvatarView[\s\S]*android:id="@\+id\/account_avatar"/);
+assert.match(customElements.layout, /<View[\s\S]*android:id="@\+id\/unknown"/);
+
+const mappedCustomElement = new ShiftLayout({
+    customElements: new Map([['feature-panel', 'FrameLayout']]),
+}).convert('<feature-panel id="feature"><p>Mapped</p></feature-panel>');
+assert.match(mappedCustomElement.layout, /<FrameLayout[\s\S]*android:id="@\+id\/feature"/);
+assert.throws(() => new ShiftLayout({ customElements: [] }), /customElements must be an object or Map/);
+assert.throws(() => new ShiftLayout({ customElements: { widget: 'View' } }), /valid hyphenated name/);
+assert.throws(() => new ShiftLayout({ customElements: { 'bad-widget': 'View><script' } }), /Android view tag/);
+
+const elementHookCalls = [];
+const hookedConversion = new ShiftLayout({
+    hooks: {
+        element(descriptor) {
+            elementHookCalls.push(descriptor.tag);
+            if (descriptor.htmlAttributes.id === 'bound_field') descriptor.attributes['app:bindingKey'] = 'profile.email';
+            if (descriptor.htmlAttributes.id === 'save_action') descriptor.attributes['android:onClick'] = 'saveProfile';
+            if (descriptor.htmlAttributes.id === 'hook_card') descriptor.attributes['android:tag'] = 'hooked-card';
+            if (descriptor.htmlAttributes.id === 'hook_nav') descriptor.attributes['app:itemRippleColor'] = '#123456';
+        },
+        interaction(record) {
+            if (record.type === 'link') return false;
+            record.handler = record.type === 'navigation' ? 'openDestination' : 'saveProfile';
+        },
+        result(result) {
+            result.extensions = { bindingClass: 'ProfileBindings' };
+        },
+    },
+}).convert(`
+    <div id="hook_card" style="border-radius: 8px; box-shadow: 0 2px 4px #000;"><p>Card</p></div>
+    <input id="bound_field" type="email">
+    <button id="save_action">Save</button>
+    <a id="filtered_link" href="/filtered">Filtered</a>
+    <nav id="hook_nav"><a href="/home">Home</a></nav>
+`);
+assert.match(hookedConversion.layout, /android:id="@\+id\/hook_card"[\s\S]*android:tag="hooked-card"/);
+assert.match(hookedConversion.layout, /android:id="@\+id\/bound_field"[\s\S]*app:bindingKey="profile\.email"/);
+assert.match(hookedConversion.layout, /android:id="@\+id\/save_action"[\s\S]*android:onClick="saveProfile"/);
+assert.match(hookedConversion.layout, /android:id="@\+id\/hook_nav"[\s\S]*app:itemRippleColor="#123456"/);
+assert.ok(['div', 'input', 'button', 'a', 'nav'].every(tag => elementHookCalls.includes(tag)));
+assert.equal(hookedConversion.interactions.some(item => item.id === 'filtered_link'), false);
+assert.equal(hookedConversion.interactions.find(item => item.id === 'save_action').handler, 'saveProfile');
+assert.equal(hookedConversion.interactions.find(item => item.id === 'nav_home').handler, 'openDestination');
+assert.deepEqual(hookedConversion.extensions, { bindingClass: 'ProfileBindings' });
+
+assert.throws(() => new ShiftLayout({ hooks: [] }), /hooks must be an object/);
+assert.throws(() => new ShiftLayout({ hooks: { unknown() {} } }), /Unknown hook/);
+assert.throws(() => new ShiftLayout({ hooks: { element: true } }), /hooks\.element must be a function/);
+assert.throws(
+    () => new ShiftLayout({ hooks: { element: descriptor => ({ ...descriptor, androidTag: '<View>' }) } }).convert('<p>Bad tag</p>'),
+    /invalid Android view tag/
+);
+assert.throws(
+    () => new ShiftLayout({ hooks: { element: descriptor => ({ ...descriptor, attributes: { 'bad attr': 'x' } }) } }).convert('<p>Bad attr</p>'),
+    /invalid XML attribute/
+);
+assert.throws(
+    () => new ShiftLayout({ hooks: { interaction: () => 42 } }).convert('<button>Bad interaction</button>'),
+    /hooks\.interaction must return/
+);
+assert.throws(
+    () => new ShiftLayout({ hooks: { result: () => [] } }).convert('<p>Bad result</p>'),
+    /hooks\.result must return/
+);
+
+const cliTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'shiftlayout-cli-'));
+try {
+    const inputFile = path.join(cliTestRoot, 'screen.html');
+    const outputDir = path.join(cliTestRoot, 'android');
+    fs.writeFileSync(path.join(cliTestRoot, 'cli.ttf'), Buffer.from('cli-font'));
+    fs.writeFileSync(inputFile, `
+        <style>
+            @font-face { font-family: CliFont; src: url("https://cdn.example.com/cli.woff2"); }
+        </style>
+        <main style="font-family: CliFont"><h1 style="color: #123456;">CLI</h1><p style="color: #123456;">CLI</p></main>
+    `);
+    const cli = spawnSync(process.execPath, [
+        path.join(__dirname, '..', 'bin', 'shiftlayout.js'),
+        inputFile,
+        '--output', outputDir,
+        '--layout-name', 'cli_screen',
+        '--prefix', 'cli',
+        '--strict',
+        '--extract-resources',
+        '--font-source', 'https://cdn.example.com/cli.woff2', 'cli.ttf',
+    ], { encoding: 'utf8' });
+    assert.equal(cli.status, 0, cli.stderr);
+    assert.match(cli.stdout, /Wrote \d+ files/);
+    assert.match(fs.readFileSync(path.join(outputDir, 'res', 'layout', 'cli_screen.xml'), 'utf8'), /android:text="@string\/sl_string_cli"/);
+    assert.ok(fs.existsSync(path.join(outputDir, 'res', 'values', 'colors.xml')));
+    assert.ok(fs.existsSync(path.join(outputDir, 'res', 'values', 'strings.xml')));
+    assert.ok(fs.existsSync(path.join(outputDir, 'res', 'font', 'sl_font_clifont.xml')));
+    assert.ok(fs.existsSync(path.join(outputDir, 'res', 'font', 'sl_font_clifont_400_normal.ttf')));
+    assert.ok(fs.existsSync(path.join(outputDir, 'diagnostics', 'warnings.json')));
+
+    fs.writeFileSync(inputFile, '<p style="transition: all 200ms;">Strict CLI</p>');
+    const strictFailure = spawnSync(process.execPath, [
+        path.join(__dirname, '..', 'bin', 'shiftlayout.js'), inputFile, '--strict',
+    ], { encoding: 'utf8', cwd: cliTestRoot });
+    assert.equal(strictFailure.status, 1);
+    assert.match(strictFailure.stderr, /ShiftLayoutConversionError/);
+    assert.match(strictFailure.stderr, /unsupported-css-property/);
+
+    const usageFailure = spawnSync(process.execPath, [
+        path.join(__dirname, '..', 'bin', 'shiftlayout.js'), '--unknown',
+    ], { encoding: 'utf8' });
+    assert.equal(usageFailure.status, 2);
+    assert.match(usageFailure.stderr, /Unknown option/);
+} finally {
+    fs.rmSync(cliTestRoot, { recursive: true, force: true });
+}
+
+const webFontFallback = new ShiftLayout().convert(`
+    <style>
+        @font-face { font-family: WebOnly; src: url("https://cdn.example.com/web.woff2"); }
+        .web-only { font-family: WebOnly, monospace; }
+    </style>
+    <p class="web-only">Fallback</p>
+`);
+assert.match(webFontFallback.layout, /android:fontFamily="monospace"/);
+assert.ok(webFontFallback.warnings.some(warning => warning.code === 'unmapped-web-font'));
+assert.ok(webFontFallback.assets.fonts.some(font => font.remote && font.source === null));
+
+const externalFont = new ShiftLayout().convert(`
+    <style>@font-face { font-family: External; src: url("https://cdn.example.com/external.woff2"); }</style>
+    <p style="font-family: External">External</p>
+`, { fontSources: new Map([['https://cdn.example.com/external.woff2', '@font/external_family']]) });
+assert.match(externalFont.layout, /android:fontFamily="@font\/external_family"/);
+assert.deepEqual(externalFont.fonts, {});
+assert.deepEqual(externalFont.assets.fonts, []);
+assert.throws(() => new ShiftLayout().convert('<p>Font</p>', { fontSources: [] }), /fontSources must be an object or Map/);
+assert.throws(
+    () => new ShiftLayout().convert('<p>Font</p>', { fontSources: { remote: 'https://other.example/font.ttf' } }),
+    /must not map to another remote URL/
 );
 
 console.log('All ShiftLayout tests passed.');

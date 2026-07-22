@@ -1,7 +1,7 @@
 const cheerio = require('cheerio');
 const { TAG_MAP, INPUT_TYPE_MAP, FONT_FAMILY_MAP } = require('./constants');
 const {
-    parseStyleDeclarations, parseCssStylesheet, normalizeMediaProfile, matchesMediaQuery,
+    parseStyleDeclarations, parseCssStylesheet, parseFontFaces, normalizeMediaProfile, matchesMediaQuery,
     selectorSpecificity, resolveCssVariables,
     normalizeStyleValue, escapeXmlAttribute, sanitizeColor, sanitizeResourceName, makeUniqueResourceName,
     resourceNameFromPath, pxToDp, pxToSp, cssSizeToAndroid,
@@ -11,7 +11,8 @@ const {
     buildXmlString,
 } = require('./utils');
 
-function getAndroidTag(tag, node) {
+function getAndroidTag(tag, node, customElements) {
+    if (customElements.has(tag)) return customElements.get(tag);
     if (tag === 'input') {
         const type = (node.attr('type') || 'text').toLowerCase();
         if (type === 'checkbox') return 'CheckBox';
@@ -39,8 +40,13 @@ const TEXT_TAGS = new Set([
 ]);
 const TABLE_SECTION_TAGS = new Set(['thead', 'tbody', 'tfoot']);
 const UNWRAP_TAGS = new Set(['picture']);
+const EMBEDDED_MEDIA_TAGS = new Set(['video', 'audio', 'iframe', 'canvas', 'embed', 'object']);
 const FLEXBOX_LAYOUT_TAG = 'com.google.android.flexbox.FlexboxLayout';
 const GRID_LAYOUT_TAG = 'GridLayout';
+const PSEUDO_CONTAINER_ANDROID_TAGS = new Set([
+    'LinearLayout', 'FrameLayout', GRID_LAYOUT_TAG, 'TableLayout', 'TableRow',
+    FLEXBOX_LAYOUT_TAG,
+]);
 const INHERITED_CSS_PROPERTIES = new Set([
     'color', 'font-family', 'font-size', 'font-style', 'font-weight', 'letter-spacing',
     'line-height', 'text-align', 'text-indent', 'text-transform', 'visibility',
@@ -51,7 +57,7 @@ const SUPPORTED_CSS_PROPERTIES = new Set([
     'background-image', 'background-position', 'background-size', 'border',
     'border-bottom', 'border-color', 'border-left', 'border-radius', 'border-right',
     'border-top', 'border-width', 'bottom', 'box-shadow', 'color', 'column-gap',
-    'cursor', 'display', 'flex', 'flex-basis', 'flex-direction', 'flex-grow',
+    'content', 'cursor', 'display', 'flex', 'flex-basis', 'flex-direction', 'flex-grow',
     'flex-shrink', 'flex-wrap', 'font-family', 'font-size', 'font-style',
     'font-weight', 'gap', 'grid-area', 'grid-auto-flow', 'grid-column',
     'grid-column-end', 'grid-column-start', 'grid-row', 'grid-row-end',
@@ -412,6 +418,185 @@ function imeActionForEnterKeyHint(value) {
     }[normalizeStyleValue(value || '')] || null;
 }
 
+function normalizeFontSources(fontSources) {
+    if (fontSources === undefined || fontSources === null) return new Map();
+    if (!(fontSources instanceof Map) && (typeof fontSources !== 'object' || Array.isArray(fontSources))) {
+        throw new TypeError('fontSources must be an object or Map keyed by declared font URL.');
+    }
+    const entries = fontSources instanceof Map ? [...fontSources.entries()] : Object.entries(fontSources);
+    const sources = new Map();
+    for (const [declaredSource, localSource] of entries) {
+        if (typeof localSource !== 'string' || !localSource.trim()) {
+            throw new TypeError(`Font source "${declaredSource}" must map to a local path or @font reference.`);
+        }
+        const mappedSource = localSource.trim();
+        if (isRemoteFontSource(mappedSource)) {
+            throw new TypeError(`Font source "${declaredSource}" must not map to another remote URL.`);
+        }
+        sources.set(String(declaredSource), mappedSource);
+    }
+    return sources;
+}
+
+function fontFaceUrls(value) {
+    return [...String(value || '').matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi)]
+        .map(match => match[2].trim())
+        .filter(Boolean);
+}
+
+function fontFileExtension(value) {
+    const clean = String(value || '').split(/[?#]/)[0];
+    return /\.(ttf|otf|ttc)$/i.exec(clean)?.[1].toLowerCase() || null;
+}
+
+function isRemoteFontSource(value) {
+    return /^(?:https?:|\/\/)/i.test(String(value || ''));
+}
+
+function decodeCssGeneratedContent(value, node) {
+    const normalized = normalizeStyleValue(value || '');
+    if (!normalized || ['none', 'normal'].includes(normalized)) return { text: null, supported: true };
+    let text = '';
+    for (const token of splitCssTokens(value)) {
+        const quote = token[0];
+        if ((quote === '"' || quote === "'") && token[token.length - 1] === quote) {
+            text += token.slice(1, -1)
+                .replace(/\\([0-9a-f]{1,6})\s?/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+                .replace(/\\(.)/gs, '$1');
+            continue;
+        }
+        const attribute = /^attr\(\s*([\w:-]+)\s*\)$/i.exec(token);
+        if (attribute) {
+            text += node.attr(attribute[1]) || '';
+            continue;
+        }
+        return { text: null, supported: false };
+    }
+    return { text, supported: true };
+}
+
+function interactionActionForHref(href) {
+    const normalized = String(href || '').trim().toLowerCase();
+    if (/^(?:https?:)?\/\//.test(normalized)) return 'open-url';
+    if (normalized.startsWith('mailto:')) return 'send-email';
+    if (normalized.startsWith('tel:')) return 'dial-phone';
+    if (normalized.startsWith('#')) return 'navigate-anchor';
+    return 'navigate';
+}
+
+function normalizeCustomElements(customElements) {
+    if (customElements === undefined || customElements === null) return new Map();
+    if (!(customElements instanceof Map) && (typeof customElements !== 'object' || Array.isArray(customElements))) {
+        throw new TypeError('customElements must be an object or Map keyed by custom-element name.');
+    }
+
+    const entries = customElements instanceof Map ? [...customElements.entries()] : Object.entries(customElements);
+    const mappings = new Map();
+    for (const [rawName, rawAndroidTag] of entries) {
+        const name = String(rawName).trim().toLowerCase();
+        const androidTag = typeof rawAndroidTag === 'string' ? rawAndroidTag.trim() : '';
+        if (!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)) {
+            throw new TypeError(`Custom element name "${rawName}" must be a valid hyphenated name.`);
+        }
+        if (!isValidAndroidTag(androidTag)) {
+            throw new TypeError(`Android view tag for "${rawName}" is invalid.`);
+        }
+        mappings.set(name, androidTag);
+    }
+    return mappings;
+}
+
+function isValidAndroidTag(value) {
+    return /^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$/.test(String(value || ''));
+}
+
+function isValidXmlAttributeName(value) {
+    return /^(?:xmlns(?::[A-Za-z_][\w.-]*)?|[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)$/.test(String(value || ''));
+}
+
+function normalizeHooks(hooks) {
+    if (hooks === undefined || hooks === null) return {};
+    if (typeof hooks !== 'object' || Array.isArray(hooks)) {
+        throw new TypeError('hooks must be an object.');
+    }
+    const supported = new Set(['element', 'interaction', 'result']);
+    for (const [name, hook] of Object.entries(hooks)) {
+        if (!supported.has(name)) throw new TypeError(`Unknown hook "${name}".`);
+        if (typeof hook !== 'function') throw new TypeError(`hooks.${name} must be a function.`);
+    }
+    return { ...hooks };
+}
+
+function normalizeResourceExtraction(value) {
+    if (value === undefined || value === null || value === false) return null;
+    if (value === true) {
+        return { colors: true, dimensions: true, strings: true, minOccurrences: 2 };
+    }
+    if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new TypeError('extractResources must be a boolean or configuration object.');
+    }
+    const supported = new Set(['colors', 'dimensions', 'strings', 'minOccurrences']);
+    for (const key of Object.keys(value)) {
+        if (!supported.has(key)) throw new TypeError(`Unknown extractResources option "${key}".`);
+    }
+    for (const key of ['colors', 'dimensions', 'strings']) {
+        if (value[key] !== undefined && typeof value[key] !== 'boolean') {
+            throw new TypeError(`extractResources.${key} must be a boolean.`);
+        }
+    }
+    const minOccurrences = value.minOccurrences ?? 2;
+    if (!Number.isInteger(minOccurrences) || minOccurrences < 1) {
+        throw new TypeError('extractResources.minOccurrences must be a positive integer.');
+    }
+    return {
+        colors: value.colors === true,
+        dimensions: value.dimensions === true,
+        strings: value.strings === true,
+        minOccurrences,
+    };
+}
+
+const EXTRACTABLE_COLOR_ATTRIBUTES = new Set([
+    'background', 'textColor', 'tint', 'backgroundTint', 'boxStrokeColor',
+    'boxBackgroundColor', 'strokeColor', 'fillColor', 'helperTextTextColor',
+    'cardBackgroundColor', 'startColor', 'centerColor', 'endColor',
+]);
+const EXTRACTABLE_STRING_ATTRIBUTES = new Set([
+    'text', 'hint', 'title', 'contentDescription', 'stateDescription',
+    'helperText', 'errorContentDescription',
+]);
+
+function extractedValueType(attribute, value, options) {
+    const localName = attribute.includes(':') ? attribute.split(':').pop() : attribute;
+    if (options.colors && EXTRACTABLE_COLOR_ATTRIBUTES.has(localName) && /^#[0-9a-f]{3,8}$/i.test(value)) {
+        return 'colors';
+    }
+    if (options.dimensions && /^-?\d*\.?\d+(?:dp|sp)$/.test(value) && (
+        /^layout_(?:width|height|margin)/.test(localName)
+        || /^(?:padding|textSize|minWidth|minHeight|maxWidth|maxHeight|elevation|cardElevation|cardCornerRadius|cornerRadius|strokeWidth|textIndent|dropDownHeight|translationX|translationY)/.test(localName)
+    )) {
+        return 'dimensions';
+    }
+    if (options.strings && EXTRACTABLE_STRING_ATTRIBUTES.has(localName)
+        && value !== '' && !value.startsWith('@') && !value.startsWith('?')) {
+        return 'strings';
+    }
+    return null;
+}
+
+function generateNavigationIcon() {
+    return `<?xml version="1.0" encoding="utf-8"?>\n${buildXmlString('vector', {
+        'xmlns:android': 'http://schemas.android.com/apk/res/android',
+        'android:width': '24dp',
+        'android:height': '24dp',
+        'android:viewportWidth': '24',
+        'android:viewportHeight': '24',
+    }, [buildXmlString('path', {
+        'android:fillColor': '#FF000000',
+        'android:pathData': 'M12,2A10,10 0,1 0,12 22A10,10 0,1 0,12 2Z',
+    })])}`;
+}
+
 class ShiftLayout {
     constructor(options = {}) {
         this.opts = {
@@ -420,6 +605,9 @@ class ShiftLayout {
             useConstraint:  options.useConstraint  ?? true,
             inputStyle:     options.inputStyle     ?? 'outlined', // 'outlined' | 'filled'
         };
+        this.customElements = normalizeCustomElements(options.customElements);
+        this.hooks = normalizeHooks(options.hooks);
+        this.resourceExtraction = normalizeResourceExtraction(options.extractResources);
         this.idCount = 0;
         this.lastTopLevelId = null;
         this.usedIds = new Set();
@@ -427,14 +615,23 @@ class ShiftLayout {
         this.menus = {};
         this.arrays = {};
         this.arraySpecs = {};
-        this.assets = { images: [] };
+        this.assets = { images: [], fonts: [] };
+        this.interactions = [];
+        this.media = [];
+        this.fonts = {};
+        this.fontFaceDeclarations = [];
+        this.fontFamilyResources = new Map();
+        this.usedFontResources = new Set();
         this.stylesheetRules = [];
         this.computedStyleCache = new WeakMap();
+        this.pseudoStyleCache = new WeakMap();
         this.warnings = [];
         this.warningKeys = new Set();
         this.inspectedStyleElements = new WeakSet();
         this.usedImageResources = new Set();
         this.imageResourceBySource = new Map();
+        this.elementIds = new WeakMap();
+        this.referenceTextById = new Map();
     }
 
     _warn({ code, message, element = null, property = null, value = null }) {
@@ -449,6 +646,197 @@ class ShiftLayout {
         const id = node.attr('id') ? `#${node.attr('id')}` : '';
         const classes = String(node.attr('class') || '').trim().split(/\s+/).filter(Boolean).map(name => `.${name}`).join('');
         return `${tag}${id}${classes}`;
+    }
+
+    _interactionFormId(node) {
+        const formId = node.attr('form') || node.closest('form').attr('id');
+        return formId ? sanitizeResourceName(formId, this.opts.prefix) : null;
+    }
+
+    _applyElementHook(node, androidTag, attributes, context) {
+        if (!this.hooks.element) return { androidTag, attributes };
+        const descriptor = {
+            tag: node.prop('tagName')?.toLowerCase() || null,
+            androidTag,
+            attributes: { ...attributes },
+            htmlAttributes: { ...(node[0]?.attribs || {}) },
+            styles: { ...(context.styles || {}) },
+            index: context.index,
+            depth: context.depth,
+        };
+        const returned = this.hooks.element(descriptor);
+        const result = returned === undefined ? descriptor : returned;
+        if (!result || typeof result !== 'object' || Array.isArray(result)) {
+            throw new TypeError('hooks.element must return an element descriptor or undefined.');
+        }
+        if (!isValidAndroidTag(result.androidTag)) {
+            throw new TypeError('hooks.element returned an invalid Android view tag.');
+        }
+        if (!result.attributes || typeof result.attributes !== 'object' || Array.isArray(result.attributes)) {
+            throw new TypeError('hooks.element returned invalid attributes.');
+        }
+        for (const name of Object.keys(result.attributes)) {
+            if (!isValidXmlAttributeName(name)) {
+                throw new TypeError(`hooks.element returned invalid XML attribute "${name}".`);
+            }
+        }
+        return { androidTag: result.androidTag, attributes: result.attributes };
+    }
+
+    _addInteraction(record, node) {
+        if (!this.hooks.interaction) {
+            this.interactions.push(record);
+            return;
+        }
+        const candidate = { ...record };
+        const returned = this.hooks.interaction(candidate, {
+            tag: node.prop('tagName')?.toLowerCase() || null,
+            htmlAttributes: { ...(node[0]?.attribs || {}) },
+        });
+        const result = returned === undefined ? candidate : returned;
+        if (result === null || result === false) return;
+        if (typeof result !== 'object' || Array.isArray(result)) {
+            throw new TypeError('hooks.interaction must return an interaction record, false, null, or undefined.');
+        }
+        this.interactions.push(result);
+    }
+
+    _referencedText(node, attribute) {
+        return String(node.attr(attribute) || '')
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean)
+            .map(id => this.referenceTextById.get(id))
+            .filter(Boolean)
+            .join(' ') || null;
+    }
+
+    _collectForms($) {
+        return $('form').toArray().map(formElement => {
+            const form = $(formElement);
+            const id = this.elementIds.get(formElement);
+            const groups = form.find('fieldset').toArray().map(fieldsetElement => {
+                const fieldset = $(fieldsetElement);
+                return {
+                    id: this.elementIds.get(fieldsetElement),
+                    label: textContentForNode(fieldset.children('legend').first()).trim() || null,
+                    fields: [],
+                };
+            }).filter(group => group.id);
+            const groupByElement = new Map(
+                form.find('fieldset').toArray().map((element, index) => [element, groups[index]?.id]).filter(([, groupId]) => groupId)
+            );
+            const fields = form.find('input, textarea, select').toArray().flatMap(fieldElement => {
+                const field = $(fieldElement);
+                const fieldId = this.elementIds.get(fieldElement);
+                if (!fieldId) return [];
+                const groupElement = field.closest('fieldset')[0];
+                const group = groupElement && groupByElement.get(groupElement) || null;
+                const constraints = {};
+                for (const attribute of ['min', 'max', 'step', 'minlength', 'maxlength', 'pattern']) {
+                    if (field.attr(attribute) !== undefined) constraints[attribute] = field.attr(attribute);
+                }
+                const metadata = {
+                    id: fieldId,
+                    name: field.attr('name') || null,
+                    type: field.prop('tagName').toLowerCase() === 'input'
+                        ? normalizeStyleValue(field.attr('type') || 'text')
+                        : field.prop('tagName').toLowerCase(),
+                    required: field.attr('required') !== undefined,
+                    disabled: field.attr('disabled') !== undefined,
+                    readOnly: field.attr('readonly') !== undefined,
+                    invalid: field.attr('aria-invalid') !== undefined && normalizeStyleValue(field.attr('aria-invalid')) !== 'false',
+                    constraints,
+                    helperText: field.attr('data-helper-text') || this._referencedText(field, 'aria-describedby'),
+                    errorText: field.attr('data-error') || this._referencedText(field, 'aria-errormessage'),
+                    group,
+                };
+                if (group) groups.find(item => item.id === group).fields.push(fieldId);
+                return [metadata];
+            });
+            return {
+                id,
+                target: form.attr('action') || null,
+                method: normalizeStyleValue(form.attr('method') || 'get'),
+                groups,
+                fields,
+            };
+        }).filter(form => form.id);
+    }
+
+    _recordInteraction(node, cleanId, tag, inputType) {
+        const id = cleanId.replace('@+id/', '');
+        let label = textContentForNode(node).trim() || node.attr('aria-label') || node.attr('title') || null;
+        if (!label && tag === 'input' && ['submit', 'button', 'reset', 'file'].includes(inputType)) {
+            label = node.attr('value') || defaultInputText(inputType);
+        }
+        if (!label && tag === 'button') label = defaultInputText(normalizeStyleValue(node.attr('type') || 'button'));
+        if (tag === 'a') {
+            const target = node.attr('href') || null;
+            this._addInteraction({
+                type: 'link', id, target,
+                action: interactionActionForHref(target),
+                label,
+            }, node);
+            return;
+        }
+        if (tag === 'form') {
+            this._addInteraction({
+                type: 'form', id,
+                target: node.attr('action') || null,
+                method: normalizeStyleValue(node.attr('method') || 'get'),
+            }, node);
+            return;
+        }
+
+        const roleButton = normalizeStyleValue(node.attr('role') || '') === 'button';
+        const isButton = tag === 'button' || (tag === 'input' && ['submit', 'button', 'reset', 'file'].includes(inputType)) || roleButton;
+        if (!isButton) return;
+        const action = tag === 'input'
+            ? (inputType === 'file' ? 'choose-file' : inputType)
+            : tag === 'button' ? normalizeStyleValue(node.attr('type') || 'submit') : 'button';
+        this._addInteraction({
+            type: 'button', id, action,
+            form: this._interactionFormId(node),
+            label,
+        }, node);
+    }
+
+    _recordMedia(node, cleanId, tag) {
+        if (!EMBEDDED_MEDIA_TAGS.has(tag)) return;
+        const source = tag === 'object'
+            ? node.attr('data') || null
+            : node.attr('src') || node.children('source').first().attr('src') || null;
+        const record = {
+            kind: tag,
+            id: cleanId.replace('@+id/', ''),
+            source,
+            mimeType: node.attr('type') || node.children('source').first().attr('type') || null,
+            title: node.attr('title') || node.attr('aria-label') || null,
+            fallbackText: textContentForNode(node).trim() || null,
+        };
+        if (['video', 'audio'].includes(tag)) {
+            Object.assign(record, {
+                controls: node.attr('controls') !== undefined,
+                autoplay: node.attr('autoplay') !== undefined,
+                loop: node.attr('loop') !== undefined,
+                muted: node.attr('muted') !== undefined,
+                preload: node.attr('preload') || null,
+                poster: tag === 'video' ? node.attr('poster') || null : null,
+            });
+        } else if (tag === 'iframe') {
+            Object.assign(record, {
+                sourceDocument: node.attr('srcdoc') || null,
+                sandbox: node.attr('sandbox') || null,
+                allow: node.attr('allow') || null,
+            });
+        } else if (tag === 'canvas') {
+            Object.assign(record, {
+                width: node.attr('width') || null,
+                height: node.attr('height') || null,
+            });
+        }
+        this.media.push(record);
     }
 
     _inspectStyles(node, styles) {
@@ -467,6 +855,14 @@ class ShiftLayout {
                     element, property, value,
                 });
                 continue;
+            }
+
+            if (property === 'content') {
+                this._warn({
+                    code: 'unsupported-css-value',
+                    message: 'CSS content is converted only on ::before and ::after pseudo-elements.',
+                    element, property, value,
+                });
             }
 
             if (COMPUTED_LENGTH_PROPERTIES.has(property) && /^(calc|min|max|clamp)\(/.test(normalized) && !pxToDp(value)) {
@@ -569,11 +965,18 @@ class ShiftLayout {
             }
             if (css === null || css === undefined) return;
 
+            this.fontFaceDeclarations.push(...parseFontFaces(css));
+
             for (const rule of parseCssStylesheet(css)) {
                 if (rule.mediaConditions.some(condition => !matchesMediaQuery(condition, mediaProfile))) continue;
                 for (const selector of rule.selectors) {
+                    const pseudoMatch = /::?(before|after)\s*$/i.exec(selector);
+                    const matchSelector = pseudoMatch
+                        ? selector.slice(0, pseudoMatch.index).trim() || '*'
+                        : selector;
                     rules.push({
-                        selector,
+                        selector: matchSelector,
+                        pseudo: pseudoMatch ? pseudoMatch[1].toLowerCase() : null,
                         declarations: rule.declarations,
                         specificity: [0, ...selectorSpecificity(selector)],
                         order: order++,
@@ -583,6 +986,112 @@ class ShiftLayout {
         });
 
         return rules;
+    }
+
+    _prepareFonts(fontSources) {
+        const families = new Map();
+        for (const face of this.fontFaceDeclarations) {
+            const family = String(face['font-family'] || '').trim().replace(/^(['"])(.*)\1$/, '$2');
+            const normalizedFamily = family.toLowerCase();
+            if (!normalizedFamily) {
+                this._warn({
+                    code: 'invalid-font-face',
+                    message: '@font-face is missing a font-family declaration.',
+                    element: '@font-face', property: 'font-family', value: face['font-family'] || null,
+                });
+                continue;
+            }
+            const urls = fontFaceUrls(face.src);
+            if (!urls.length) {
+                this._warn({
+                    code: 'unsupported-font-source',
+                    message: `Font family "${family}" has no URL source that can become an Android font resource.`,
+                    element: '@font-face', property: 'src', value: face.src || null,
+                });
+                continue;
+            }
+
+            let selected = false;
+            const sourceFailures = [];
+            for (const declaredSource of urls) {
+                const mappedSource = fontSources.get(declaredSource);
+                if (!mappedSource && isRemoteFontSource(declaredSource)) {
+                    sourceFailures.push({ code: 'unmapped-web-font', source: declaredSource });
+                    continue;
+                }
+                const source = mappedSource || declaredSource;
+                if (source.startsWith('@font/')) {
+                    this.fontFamilyResources.set(normalizedFamily, source);
+                    selected = true;
+                    break;
+                }
+                const extension = fontFileExtension(source);
+                if (!extension) {
+                    sourceFailures.push({ code: 'unsupported-font-format', source });
+                    continue;
+                }
+
+                let group = families.get(normalizedFamily);
+                if (!group) {
+                    const familyBase = `sl_font_${sanitizeResourceName(family, 'family')}`;
+                    group = {
+                        family,
+                        resource: makeUniqueResourceName(familyBase, this.usedFontResources),
+                        faces: [],
+                    };
+                    families.set(normalizedFamily, group);
+                }
+                const weightValue = normalizeStyleValue(face['font-weight'] || '400');
+                const parsedWeight = weightValue === 'bold' ? 700 : weightValue === 'normal' ? 400 : parseInt(weightValue, 10);
+                const weight = Number.isFinite(parsedWeight) ? Math.max(1, Math.min(1000, parsedWeight)) : 400;
+                const style = /^(?:italic|oblique)$/.test(normalizeStyleValue(face['font-style'] || 'normal')) ? 'italic' : 'normal';
+                const fileBase = `${group.resource}_${weight}_${style}`;
+                const resource = makeUniqueResourceName(fileBase, this.usedFontResources);
+                group.faces.push({ resource, weight, style });
+                this.assets.fonts.push({
+                    family,
+                    declaredSource,
+                    source,
+                    resource,
+                    weight,
+                    style,
+                    remote: false,
+                });
+                selected = true;
+                break;
+            }
+            if (!selected) {
+                for (const failure of sourceFailures) {
+                    if (failure.code === 'unmapped-web-font') {
+                        this.assets.fonts.push({
+                            family, declaredSource: failure.source, source: null, resource: null,
+                            weight: null, style: null, remote: true,
+                        });
+                    }
+                    this._warn({
+                        code: failure.code,
+                        message: failure.code === 'unmapped-web-font'
+                            ? `Remote font "${failure.source}" requires an explicit fontSources mapping.`
+                            : `Font source "${failure.source}" must use TTF, OTF, or TTC format.`,
+                        element: '@font-face', property: 'src', value: failure.source,
+                    });
+                }
+                continue;
+            }
+        }
+
+        for (const [family, group] of families) {
+            if (!group.faces.length) continue;
+            const children = group.faces.map(face => buildXmlString('font', {
+                'android:font': `@font/${face.resource}`,
+                'android:fontStyle': face.style,
+                'android:fontWeight': String(face.weight),
+            }));
+            this.fonts[`${group.resource}.xml`] = `<?xml version="1.0" encoding="utf-8"?>\n${buildXmlString('font-family', {
+                'xmlns:android': 'http://schemas.android.com/apk/res/android',
+            }, children)}`;
+            this.fontFamilyResources.set(family, `@font/${group.resource}`);
+        }
     }
 
     _getComputedStyles($, node) {
@@ -609,6 +1118,7 @@ class ShiftLayout {
         }
 
         for (const rule of this.stylesheetRules) {
+            if (rule.pseudo) continue;
             let matches = false;
             try {
                 matches = node.is(rule.selector);
@@ -666,6 +1176,157 @@ class ShiftLayout {
 
         this.computedStyleCache.set(element, styles);
         return styles;
+    }
+
+    _getPseudoStyles(node, pseudo) {
+        const element = node[0];
+        if (!element) return {};
+        let cached = this.pseudoStyleCache.get(element);
+        if (!cached) {
+            cached = {};
+            this.pseudoStyleCache.set(element, cached);
+        }
+        if (cached[pseudo]) return cached[pseudo];
+
+        const winners = {};
+        const hostStyles = this._getComputedStyles(null, node);
+        for (const [property, value] of Object.entries(hostStyles)) {
+            if (property.startsWith('--') || INHERITED_CSS_PROPERTIES.has(property)) {
+                winners[property] = {
+                    value,
+                    important: false,
+                    specificity: [-1, 0, 0, 0],
+                    order: -1,
+                    declarationOrder: -1,
+                };
+            }
+        }
+
+        for (const rule of this.stylesheetRules) {
+            if (rule.pseudo !== pseudo) continue;
+            let matches = false;
+            try {
+                matches = node.is(rule.selector);
+            } catch {
+                this._warn({
+                    code: 'invalid-css-selector',
+                    message: `CSS selector "${rule.selector}" could not be matched.`,
+                    value: rule.selector,
+                });
+                continue;
+            }
+            if (!matches) continue;
+            rule.declarations.forEach((declaration, declarationOrder) => {
+                const candidate = {
+                    value: declaration.value,
+                    important: declaration.important,
+                    specificity: rule.specificity,
+                    order: rule.order,
+                    declarationOrder,
+                };
+                if (shouldReplaceDeclaration(winners[declaration.property], candidate)) {
+                    winners[declaration.property] = candidate;
+                }
+            });
+        }
+
+        const styles = Object.fromEntries(
+            Object.entries(winners).map(([property, declaration]) => [property, declaration.value])
+        );
+        const variables = Object.fromEntries(
+            Object.entries(styles).filter(([property]) => property.startsWith('--'))
+        );
+        for (const property of Object.keys(variables)) {
+            variables[property] = resolveCssVariables(variables[property], variables);
+            styles[property] = variables[property];
+        }
+        for (const [property, value] of Object.entries(styles)) {
+            if (!property.startsWith('--')) styles[property] = resolveCssVariables(value, variables);
+        }
+        cached[pseudo] = styles;
+        return styles;
+    }
+
+    _pseudoText(node, pseudo, mode) {
+        const styles = this._getPseudoStyles(node, pseudo);
+        if (!styles.content || normalizeStyleValue(styles.display || '') === 'none') return null;
+        const decoded = decodeCssGeneratedContent(styles.content, node);
+        const element = `${this._elementSelector(node)}::${pseudo}`;
+        if (!decoded.supported) {
+            this._warn({
+                code: 'unsupported-css-value',
+                message: 'Pseudo-element content supports quoted text and attr() values.',
+                element, property: 'content', value: styles.content,
+            });
+            return null;
+        }
+        if (!decoded.text) return null;
+        if (mode === 'unsupported') {
+            this._warn({
+                code: 'unsupported-css-value',
+                message: 'Pseudo-element content cannot be nested in this Android view type.',
+                element, property: 'content', value: styles.content,
+            });
+            return null;
+        }
+
+        const mappedForContainer = new Set([
+            'content', 'display', 'color', 'font-size', 'font-weight', 'font-style',
+            'font-family', 'text-align', 'text-transform', 'background-color',
+            'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+            'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+        ]);
+        const hostStyles = mode === 'inline' ? this._getComputedStyles(null, node) : null;
+        for (const [property, value] of Object.entries(styles)) {
+            if (property.startsWith('--') || ['content', 'display', 'text-transform'].includes(property)) continue;
+            if (mode === 'inline' && hostStyles[property] === value) continue;
+            if (mode === 'container' && mappedForContainer.has(property)) continue;
+            this._warn({
+                code: 'approximated-css',
+                message: mode === 'inline'
+                    ? 'Pseudo-element styling is flattened into the host Android text view.'
+                    : `Pseudo-element CSS property "${property}" is not mapped to its generated TextView.`,
+                element, property, value,
+            });
+        }
+        return {
+            text: applyTextTransform(decoded.text, styles['text-transform']),
+            styles,
+        };
+    }
+
+    _buildPseudoTextView(node, pseudo) {
+        const generated = this._pseudoText(node, pseudo, 'container');
+        if (!generated) return null;
+        const { text, styles } = generated;
+        const attrs = {
+            'android:layout_width': 'wrap_content',
+            'android:layout_height': 'wrap_content',
+            'android:text': text,
+        };
+        const color = sanitizeColor(styles.color);
+        if (color) attrs['android:textColor'] = color;
+        const size = pxToSp(styles['font-size']);
+        if (size) attrs['android:textSize'] = size;
+        const weight = normalizeStyleValue(styles['font-weight'] || '');
+        const italic = normalizeStyleValue(styles['font-style'] || '') === 'italic';
+        if (weight === 'bold' || parseInt(weight, 10) >= 600) attrs['android:textStyle'] = 'bold';
+        if (italic) attrs['android:textStyle'] = attrs['android:textStyle'] ? `${attrs['android:textStyle']}|italic` : 'italic';
+        if (styles['font-family']) {
+            const families = styles['font-family'].split(',').map(value => value.replace(/['"]/g, '').trim().toLowerCase());
+            const resourceFamily = families.find(family => this.fontFamilyResources.has(family));
+            const systemFamily = families.find(family => FONT_FAMILY_MAP[family]);
+            attrs['android:fontFamily'] = resourceFamily
+                ? this.fontFamilyResources.get(resourceFamily)
+                : FONT_FAMILY_MAP[systemFamily] || 'sans-serif';
+        }
+        const gravity = { center: 'center', right: 'end', left: 'start' }[normalizeStyleValue(styles['text-align'] || '')];
+        if (gravity) attrs['android:gravity'] = gravity;
+        const background = sanitizeColor(styles['background-color']);
+        if (background) attrs['android:background'] = background;
+        applyBoxSpacing(attrs, styles, 'padding', 'android:padding');
+        applyBoxSpacing(attrs, styles, 'margin', 'android:layout_margin');
+        return buildXmlString('TextView', attrs);
     }
 
     _usesAdvancedFlex(styles, childStyles) {
@@ -761,6 +1422,7 @@ class ShiftLayout {
         const rawId = node.attr('id') || `${this.opts.prefix}_${this.idCount++}`;
         const baseId = sanitizeResourceName(rawId, this.opts.prefix);
         const id = makeUniqueResourceName(baseId, this.usedIds);
+        if (node[0]) this.elementIds.set(node[0], id);
         return `@+id/${id}`;
     }
 
@@ -906,6 +1568,22 @@ class ShiftLayout {
         if (strokeColor) outerAttrs['app:boxStrokeColor'] = strokeColor;
         const bgColor = sanitizeColor(styles['background-color'] || '') || extractBackgroundColor(styles['background'] || '');
         if (bgColor) outerAttrs['app:boxBackgroundColor'] = bgColor;
+        const helperText = node.attr('data-helper-text');
+        const errorText = node.attr('data-error') || this._referencedText(node, 'aria-errormessage');
+        const invalid = node.attr('aria-invalid') !== undefined && normalizeStyleValue(node.attr('aria-invalid')) !== 'false';
+        if (helperText) {
+            outerAttrs['app:helperTextEnabled'] = 'true';
+            outerAttrs['app:helperText'] = helperText;
+        }
+        if (errorText) {
+            outerAttrs['app:errorEnabled'] = 'true';
+            outerAttrs['app:errorContentDescription'] = errorText;
+        }
+        if (invalid && errorText) {
+            outerAttrs['app:helperTextEnabled'] = 'true';
+            outerAttrs['app:helperText'] = errorText;
+            outerAttrs['app:helperTextTextColor'] = '#B00020';
+        }
 
         const innerAttrs = {
             'android:layout_width':  'match_parent',
@@ -936,9 +1614,15 @@ class ShiftLayout {
         }
 
         const innerChildren = node.attr('autofocus') !== undefined ? [buildXmlString('requestFocus', {})] : [];
+        const transformed = this._applyElementHook(
+            node,
+            'com.google.android.material.textfield.TextInputLayout',
+            outerAttrs,
+            { index, depth, styles }
+        );
 
         return buildXmlString(
-            'com.google.android.material.textfield.TextInputLayout', outerAttrs,
+            transformed.androidTag, transformed.attributes,
             [buildXmlString('com.google.android.material.textfield.TextInputEditText', innerAttrs, innerChildren)]
         );
     }
@@ -965,17 +1649,32 @@ class ShiftLayout {
             const a    = $(child);
             const text = a.text().trim();
             const safe = makeUniqueResourceName(sanitizeResourceName(text, `item_${i + 1}`), usedMenuItemIds);
+            const icon = `ic_nav_${i + 1}`;
+            if (!this.drawables[`${icon}.xml`]) this.drawables[`${icon}.xml`] = generateNavigationIcon();
+            this._addInteraction({
+                type: 'navigation',
+                id: `nav_${safe}`,
+                containerId: cleanId.replace('@+id/', ''),
+                target: a.attr('href') || null,
+                label: text || null,
+            }, a);
             items.push(buildXmlString('item', {
                 'android:id': `@+id/nav_${safe}`,
                 'android:title': text,
-                'android:icon': `@drawable/ic_nav_${i + 1}`,
+                'android:icon': `@drawable/${icon}`,
             }));
         });
         this.menus[`${menuId}.xml`] = `<?xml version="1.0" encoding="utf-8"?>\n${buildXmlString('menu', {
             'xmlns:android': 'http://schemas.android.com/apk/res/android',
         }, items)}`;
 
-        return buildXmlString('com.google.android.material.bottomnavigation.BottomNavigationView', attrs);
+        const transformed = this._applyElementHook(
+            node,
+            'com.google.android.material.bottomnavigation.BottomNavigationView',
+            attrs,
+            { index, depth, styles }
+        );
+        return buildXmlString(transformed.androidTag, transformed.attributes);
     }
 
     // CardView from LinearLayout + border-radius + elevation
@@ -1012,7 +1711,13 @@ class ShiftLayout {
         }
         applyBoxSpacing(innerAttrs, styles, 'padding', 'android:padding');
 
-        return buildXmlString('androidx.cardview.widget.CardView', cardAttrs,
+        const transformed = this._applyElementHook(
+            node,
+            'androidx.cardview.widget.CardView',
+            cardAttrs,
+            { index, depth, styles }
+        );
+        return buildXmlString(transformed.androidTag, transformed.attributes,
             [buildXmlString(innerTag, innerAttrs, children)]);
     }
 
@@ -1075,8 +1780,12 @@ class ShiftLayout {
                         attrs['android:textStyle'] = attrs['android:textStyle'] ? attrs['android:textStyle'] + '|italic' : 'italic';
                     break;
                 case 'font-family': {
-                    const fam = v.split(',')[0].replace(/['"]/g, '').trim().toLowerCase();
-                    attrs['android:fontFamily'] = FONT_FAMILY_MAP[fam] || 'sans-serif';
+                    const families = v.split(',').map(value => value.replace(/['"]/g, '').trim().toLowerCase());
+                    const resourceFamily = families.find(family => this.fontFamilyResources.has(family));
+                    const systemFamily = families.find(family => FONT_FAMILY_MAP[family]);
+                    attrs['android:fontFamily'] = resourceFamily
+                        ? this.fontFamilyResources.get(resourceFamily)
+                        : FONT_FAMILY_MAP[systemFamily] || 'sans-serif';
                     break;
                 }
                 case 'text-align': {
@@ -1300,11 +2009,19 @@ class ShiftLayout {
         }
 
         // Text content: containers don't get android:text
-        if (TEXT_TAGS.has(tag)) {
+        if ((TEXT_TAGS.has(tag) && tag !== 'input') || androidTag === 'TextView') {
             const text = textContentForNode(node);
             const valueText = tag === 'input' ? (node.attr('value') || defaultInputText(inputType)) : null;
             const buttonText = tag === 'button' ? defaultInputText(normalizeStyleValue(node.attr('type') || 'button')) : null;
             const rawText = valueText || text || buttonText;
+            const before = this._pseudoText(node, 'before', 'inline')?.text || '';
+            const after = this._pseudoText(node, 'after', 'inline')?.text || '';
+            const hostText = applyTextTransform(rawText || '', styles['text-transform']);
+            if (before || hostText || after) attrs['android:text'] = `${before}${hostText}${after}`;
+        } else if (tag === 'input') {
+            const text = textContentForNode(node);
+            const valueText = node.attr('value') || defaultInputText(inputType);
+            const rawText = valueText || text;
             if (rawText) attrs['android:text'] = applyTextTransform(rawText, styles['text-transform']);
         }
 
@@ -1443,9 +2160,25 @@ class ShiftLayout {
         if (tag === 'input' && ['checkbox', 'radio'].includes(inputType) && node.attr('value')) attrs['android:tag'] = node.attr('value');
         if (node.attr('disabled') !== undefined) attrs['android:enabled'] = 'false';
         if (tag === 'hr') { attrs['android:layout_width'] = 'match_parent'; attrs['android:layout_height'] = '1dp'; if (!attrs['android:background']) attrs['android:background'] = '#CCCCCC'; }
-        if (tag === 'video') { attrs['android:layout_width'] = 'match_parent'; attrs['android:layout_height'] = 'wrap_content'; }
-        if (tag === 'iframe') { attrs['android:layout_width'] = 'match_parent'; attrs['android:layout_height'] = 'match_parent'; }
+        if (['video', 'audio'].includes(tag)) {
+            if (attrs['android:layout_width'] === 'wrap_content') attrs['android:layout_width'] = 'match_parent';
+        }
+        if (['iframe', 'embed', 'object'].includes(tag)) {
+            if (attrs['android:layout_width'] === 'wrap_content') attrs['android:layout_width'] = 'match_parent';
+            if (attrs['android:layout_height'] === 'wrap_content') attrs['android:layout_height'] = 'match_parent';
+        }
+        if (EMBEDDED_MEDIA_TAGS.has(tag)) {
+            const source = tag === 'object'
+                ? node.attr('data')
+                : node.attr('src') || node.children('source').first().attr('src');
+            if (source) attrs['android:tag'] = source;
+            const description = node.attr('aria-label') || node.attr('title') || textContentForNode(node).trim();
+            if (description) attrs['android:contentDescription'] = description;
+            this._recordMedia(node, cleanId, tag);
+        }
         if (tag === 'input' && ['checkbox', 'radio'].includes(inputType)) { /* label handled by parent */ }
+
+        this._recordInteraction(node, cleanId, tag, inputType);
 
         return attrs;
     }
@@ -1501,8 +2234,8 @@ class ShiftLayout {
         const overflowY = normalizeStyleValue(styles['overflow-y'] || '');
         const overflow = normalizeStyleValue(styles['overflow'] || '');
         const needsScroll = ['scroll','auto'].includes(overflowY) || ['scroll','auto'].includes(overflow);
-        let androidTag    = getAndroidTag(tag, node);
-        const directChildren = node.children().toArray().map((child, originalIndex) => ({
+        let androidTag    = getAndroidTag(tag, node, this.customElements);
+        const directChildren = (EMBEDDED_MEDIA_TAGS.has(tag) ? [] : node.children().toArray()).map((child, originalIndex) => ({
             child,
             originalIndex,
             styles: expandInsetStyles(this._getComputedStyles($, $(child))),
@@ -1511,6 +2244,11 @@ class ShiftLayout {
         if (androidTag === 'LinearLayout') {
             if (isGridContainer(styles)) androidTag = GRID_LAYOUT_TAG;
             else if (this._usesAdvancedFlex(styles, directChildren.map(item => item.styles))) androidTag = FLEXBOX_LAYOUT_TAG;
+        }
+        const supportsInlinePseudo = ((TEXT_TAGS.has(tag) && tag !== 'input') || androidTag === 'TextView');
+        if (!supportsInlinePseudo && !PSEUDO_CONTAINER_ANDROID_TAGS.has(androidTag)) {
+            this._pseudoText(node, 'before', 'unsupported');
+            this._pseudoText(node, 'after', 'unsupported');
         }
 
         const hasOutOfFlowChild = directChildren.some(item => isOutOfFlowPosition(item.styles['position']));
@@ -1535,10 +2273,16 @@ class ShiftLayout {
         orderedChildren.forEach((item, i) => {
             const child = item.child;
             const childTag = $(child).prop('tagName')?.toLowerCase();
-            if (TEXT_TAGS.has(tag) && TEXT_TAGS.has(childTag)) return;
+            if ((TEXT_TAGS.has(tag) || androidTag === 'TextView') && TEXT_TAGS.has(childTag)) return;
             const result = this.convertNode($, child, i, depth + 1, tag, node);
             if (result) children.push(result);
         });
+        if (PSEUDO_CONTAINER_ANDROID_TAGS.has(androidTag)) {
+            const before = this._buildPseudoTextView(node, 'before');
+            const after = this._buildPseudoTextView(node, 'after');
+            if (before) children.unshift(before);
+            if (after) children.push(after);
+        }
 
         if (isCard) {
             return this._buildCardView(
@@ -1549,16 +2293,18 @@ class ShiftLayout {
 
         const attrs = this.getAndroidAttrs(node, index, depth, androidTag, styles, parentStyles);
         this._applyListItemText(attrs, tag, parentTag, parentNode, index);
+        const transformed = this._applyElementHook(node, androidTag, attrs, { index, depth, styles });
+        androidTag = transformed.androidTag;
 
         if (needsScroll) {
             const scrollAttrs = { 'android:fillViewport': 'true' }, innerAttrs = {};
-            for (const [k, v] of Object.entries(attrs)) (SCROLL_OUTER_KEYS.has(k) ? scrollAttrs : innerAttrs)[k] = v;
+            for (const [k, v] of Object.entries(transformed.attributes)) (SCROLL_OUTER_KEYS.has(k) ? scrollAttrs : innerAttrs)[k] = v;
             innerAttrs['android:layout_width'] = 'match_parent';
             innerAttrs['android:layout_height'] = 'wrap_content';
             return buildXmlString('ScrollView', scrollAttrs, [buildXmlString(androidTag, innerAttrs, children)]);
         }
 
-        return buildXmlString(androidTag, attrs, children);
+        return buildXmlString(androidTag, transformed.attributes, children);
     }
 
     _applyListItemText(attrs, tag, parentTag, parentNode, index) {
@@ -1597,18 +2343,97 @@ class ShiftLayout {
         return `<?xml version="1.0" encoding="utf-8"?>\n<resources>\n${body}\n</resources>`;
     }
 
+    _extractValueResources(layout, values) {
+        const options = this.resourceExtraction;
+        if (!options) return { layout, manifest: null };
+
+        const documents = [
+            { type: 'layout', key: null, xml: layout },
+            ...Object.entries(this.drawables).map(([key, xml]) => ({ type: 'drawable', key, xml })),
+            ...Object.entries(this.menus).map(([key, xml]) => ({ type: 'menu', key, xml })),
+        ];
+        const counts = {
+            colors: new Map(),
+            dimensions: new Map(),
+            strings: new Map(),
+        };
+        const attributePattern = /([A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)="([^"]*)"/g;
+        for (const document of documents) {
+            document.xml.replace(attributePattern, (match, attribute, value) => {
+                const type = extractedValueType(attribute, value, options);
+                if (type) counts[type].set(value, (counts[type].get(value) || 0) + 1);
+                return match;
+            });
+        }
+
+        const names = { colors: new Map(), dimensions: new Map(), strings: new Map() };
+        const usedNames = { colors: new Set(), dimensions: new Set(), strings: new Set() };
+        for (const [type, valuesByCount] of Object.entries(counts)) {
+            for (const [value, count] of valuesByCount) {
+                if (count < options.minOccurrences) continue;
+                let baseName;
+                if (type === 'colors') {
+                    baseName = `sl_color_${value.slice(1).toLowerCase()}`;
+                } else if (type === 'dimensions') {
+                    baseName = `sl_dimen_${value.toLowerCase().replace(/^-/, 'neg_').replace(/\./g, '_')}`;
+                } else {
+                    const textName = sanitizeResourceName(value.replace(/&[a-z0-9#]+;/gi, ' '), 'text').slice(0, 48);
+                    baseName = `sl_string_${textName}`;
+                }
+                names[type].set(value, makeUniqueResourceName(baseName, usedNames[type]));
+            }
+        }
+
+        const resourceType = { colors: 'color', dimensions: 'dimen', strings: 'string' };
+        const rewrite = xml => xml.replace(attributePattern, (match, attribute, value) => {
+            const type = extractedValueType(attribute, value, options);
+            const name = type && names[type].get(value);
+            return name ? `${attribute}="@${resourceType[type]}/${name}"` : match;
+        });
+        for (const document of documents) {
+            document.xml = rewrite(document.xml);
+            if (document.type === 'layout') layout = document.xml;
+            else if (document.type === 'drawable') this.drawables[document.key] = document.xml;
+            else this.menus[document.key] = document.xml;
+        }
+
+        const manifest = { colors: {}, dimensions: {}, strings: {} };
+        const fileSpecs = {
+            colors: ['colors.xml', 'color'],
+            dimensions: ['dimens.xml', 'dimen'],
+            strings: ['strings.xml', 'string'],
+        };
+        for (const [type, valueNames] of Object.entries(names)) {
+            const entries = [...valueNames.entries()];
+            for (const [value, name] of entries) manifest[type][name] = value;
+            if (!entries.length) continue;
+            const [filename, element] = fileSpecs[type];
+            const body = entries
+                .map(([value, name]) => `    <${element} name="${name}">${value}</${element}>`)
+                .join('\n');
+            values[filename] = `<?xml version="1.0" encoding="utf-8"?>\n<resources>\n${body}\n</resources>`;
+        }
+        return { layout, manifest };
+    }
+
     convert(html, options = {}) {
         if (!options || typeof options !== 'object' || Array.isArray(options)) {
             throw new TypeError('convert options must be an object.');
+        }
+        if (options.strict !== undefined && typeof options.strict !== 'boolean') {
+            throw new TypeError('strict must be a boolean.');
         }
         const $ = cheerio.load(html);
         this.warnings = [];
         this.warningKeys = new Set();
         this.inspectedStyleElements = new WeakSet();
         const stylesheetSources = normalizeStylesheetSources(options.stylesheets);
+        const fontSources = normalizeFontSources(options.fontSources);
         const mediaProfile = normalizeMediaProfile(options.media);
+        this.fontFaceDeclarations = [];
         this.stylesheetRules = this._collectStylesheetRules($, stylesheetSources, mediaProfile);
         this.computedStyleCache = new WeakMap();
+        this.pseudoStyleCache = new WeakMap();
         const body     = $('body').length ? $('body') : $.root();
         const usesTools = /<img/i.test(html);
         const rootAttrs = {
@@ -1627,33 +2452,68 @@ class ShiftLayout {
         this.menus          = {};
         this.arrays         = {};
         this.arraySpecs     = {};
-        this.assets         = { images: [] };
+        this.assets         = { images: [], fonts: [] };
+        this.fonts          = {};
+        this.fontFamilyResources = new Map();
+        this.usedFontResources = new Set();
+        this.interactions   = [];
+        this.media          = [];
         this.usedImageResources = new Set();
         this.imageResourceBySource = new Map();
+        this.elementIds = new WeakMap();
+        this.referenceTextById = new Map();
+        this._prepareFonts(fontSources);
+        $('[id]').each((_, element) => {
+            const node = $(element);
+            this.referenceTextById.set(node.attr('id'), textContentForNode(node).trim());
+        });
         const content = [];
         body.children().each((i, el) => {
             const converted = this.convertNode($, el, i, 0);
             if (converted) content.push(converted);
         });
 
-        const layout = `<?xml version="1.0" encoding="utf-8"?>\n${buildXmlString('androidx.constraintlayout.widget.ConstraintLayout', rootAttrs, content)}`;
+        let layout = `<?xml version="1.0" encoding="utf-8"?>\n${buildXmlString('androidx.constraintlayout.widget.ConstraintLayout', rootAttrs, content)}`;
         const values = {};
         const arraysXml = this._buildValuesArraysXml();
         if (arraysXml) values['arrays.xml'] = arraysXml;
-        return {
+        const extraction = this._extractValueResources(layout, values);
+        layout = extraction.layout;
+        const forms = this._collectForms($);
+        let result = {
             layout,
             drawables: this.drawables,
             menus: this.menus,
             arrays: this.arrays,
             values,
+            fonts: this.fonts,
             resources: {
                 drawables: this.drawables,
                 menus: this.menus,
                 values,
+                fonts: this.fonts,
             },
             assets: this.assets,
+            interactions: this.interactions,
+            forms,
+            media: this.media,
+            extractedResources: extraction.manifest,
             warnings: this.warnings,
         };
+        if (this.hooks.result) {
+            const returned = this.hooks.result(result);
+            if (returned !== undefined) result = returned;
+            if (!result || typeof result !== 'object' || Array.isArray(result)) {
+                throw new TypeError('hooks.result must return a conversion result or undefined.');
+            }
+        }
+        if (options.strict && this.warnings.length) {
+            const error = new Error(`ShiftLayout strict conversion failed with ${this.warnings.length} warning(s).`);
+            error.name = 'ShiftLayoutConversionError';
+            error.warnings = [...this.warnings];
+            throw error;
+        }
+        return result;
     }
 }
 

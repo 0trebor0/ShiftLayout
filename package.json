@@ -3,13 +3,19 @@
   "version": "5.0.0",
   "description": "Convert HTML and inline CSS into Android XML layouts.",
   "main": "index.js",
+  "bin": {
+    "shiftlayout": "bin/shiftlayout.js"
+  },
   "scripts": {
-    "test": "node test\\shiftlayout.test.js",
-    "example": "node examples\\write-android-resources.js"
+    "test": "node --test test/parser.test.js test/resource.test.js test/layout.test.js test/form.test.js test/accessibility.test.js test/shiftlayout.test.js",
+    "test:performance": "node test/performance.test.js",
+    "test:android:generate": "node test/generate-android-validation.js",
+    "example": "node examples/write-android-resources.js"
   },
   "files": [
     "index.js",
     "lib.js",
+    "bin/",
     "src/",
     "examples/write-android-resources.js",
     "README.md",
@@ -26,6 +32,9 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20.18.1"
+  },
   "dependencies": {
     "cheerio": "^1.1.2",
     "xml-formatter": "^3.6.7"

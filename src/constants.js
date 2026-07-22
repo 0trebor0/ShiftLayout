@@ -23,7 +23,10 @@ const TAG_MAP = {
     progress: 'ProgressBar', meter: 'ProgressBar',
     hr: 'View',
     video: 'VideoView',
+    audio: 'VideoView',
     iframe: 'WebView',
+    canvas: 'View',
+    embed: 'WebView', object: 'WebView',
     fieldset: 'LinearLayout', legend: 'TextView',
     table: 'TableLayout', tr: 'TableRow', td: 'TextView', th: 'TextView', caption: 'TextView',
 };

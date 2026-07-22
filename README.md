@@ -8,6 +8,9 @@ See [ROADMAP.md](ROADMAP.md) for completed capabilities, upcoming features, and 
 
 ## Installation
 
+ShiftLayout requires Node.js 20.18.1 or newer. Continuous integration tests the
+minimum release and the Node.js 22 and 24 release lines on Linux.
+
 ```bash
 npm install shiftlayout
 ```
@@ -29,7 +32,10 @@ const html = `
 </div>
 `;
 
-const { layout, drawables, menus, arrays, values, resources, assets } = sculptor.convert(html);
+const {
+    layout, drawables, menus, arrays, values, fonts, resources, assets,
+    interactions, forms, media, extractedResources, warnings,
+} = sculptor.convert(html);
 
 // layout    -> paste into res/layout/activity_main.xml
 // drawables -> write each entry to res/drawable/<name>
@@ -48,8 +54,56 @@ const sculptor = new ShiftLayout({
     defaultPadding: '20dp',      // Root layout padding (default: '16dp')
     useConstraint:  true,        // Emit constraint attrs on top-level elements (default: true)
     inputStyle:     'outlined',  // TextInputLayout style: 'outlined' | 'filled' (default: 'outlined')
+    customElements: {            // Optional web-component to Android view mappings
+        'app-card': 'LinearLayout',
+        'user-avatar': 'com.example.views.AvatarView',
+    },
+    extractResources: true,      // Optional repeated color/dimen/string extraction
 });
 ```
+
+`customElements` accepts an object or `Map`. Keys must be valid hyphenated custom
+element names, and values must be safe simple or fully qualified Android view
+tags. A mapping to `LinearLayout` receives normal container orientation behavior;
+a mapping to `TextView` receives the custom element's flattened text content.
+Unmapped custom elements continue to fall back to `View`.
+
+### Extension Hooks
+
+Constructor hooks support application-specific XML attributes, event metadata,
+and result artifacts without changing the core mappings:
+
+```javascript
+const converter = new ShiftLayout({
+    hooks: {
+        element(descriptor) {
+            if (descriptor.htmlAttributes['data-handler']) {
+                descriptor.attributes['android:onClick'] =
+                    descriptor.htmlAttributes['data-handler'];
+            }
+        },
+        interaction(record) {
+            record.bindingHandler = `handle_${record.id}`;
+            // Return false or null to omit this interaction record.
+        },
+        result(result) {
+            result.extensions = { bindingClass: 'ScreenBindings' };
+        },
+    },
+});
+```
+
+The `element` hook receives the HTML tag and attributes, selected Android tag,
+generated Android attributes, computed styles, sibling index, and depth. It may
+mutate the descriptor or return a replacement descriptor. Android view tags and
+XML attribute names are validated, and attribute values remain XML-escaped.
+The hook runs for normal views and special wrappers such as text inputs, cards,
+and bottom navigation; skipped structural HTML does not produce hook calls.
+
+The `interaction` hook may mutate or replace each record, or filter it by
+returning `false`/`null`. The `result` hook may mutate the complete conversion
+result or return a replacement object. Hook errors and malformed return values
+fail conversion rather than producing silently corrupted output.
 
 ---
 
@@ -64,9 +118,55 @@ const sculptor = new ShiftLayout({
 | `menus` | `{ [filename]: string }` | `res/menu/` |
 | `arrays` | `{ [filename]: string }` | `res/values/` per-select string arrays |
 | `values` | `{ [filename]: string }` | Combined `res/values/` files such as `arrays.xml` |
-| `resources` | `{ drawables, menus, values }` | Grouped Android resource files |
-| `assets` | `{ images: Array<{ source, resource, density }> }` | External image manifest |
+| `fonts` | `{ [filename]: string }` | Generated Android font-family XML in `res/font/` |
+| `resources` | `{ drawables, menus, values, fonts }` | Grouped Android resource files |
+| `assets` | `{ images: Array<object>, fonts: Array<object> }` | External image and font manifests |
+| `interactions` | `Array<object>` | Runtime wiring metadata for forms, links, buttons, and navigation |
+| `forms` | `Array<object>` | Form groups, controls, constraints, and validation/help metadata |
+| `media` | `Array<object>` | Runtime metadata for media, web, canvas, and embedded content |
+| `extractedResources` | `{ colors, dimensions, strings } \| null` | Generated value-resource manifest when extraction is enabled |
 | `warnings` | `Array<{ severity, code, message, element, property, value }>` | Structured conversion diagnostics |
+
+### Interaction Metadata
+
+Interactive HTML produces metadata alongside the static Android XML:
+
+```javascript
+const { interactions } = sculptor.convert(`
+    <form id="profile" action="/profiles" method="post">
+        <a id="help" href="https://example.com/help">Help</a>
+        <button id="save" type="submit">Save</button>
+    </form>
+`);
+```
+
+Each record contains its generated Android resource `id` and a `type` of
+`form`, `link`, `button`, or `navigation`. Records also include the applicable
+target, action, HTTP method, form association, label, or navigation container.
+The resource writer saves the array to `diagnostics/interactions.json`. This is
+metadata for application wiring; ShiftLayout does not generate runtime event code.
+
+### Form Metadata And Support Text
+
+Forms include fieldset groups and converted controls in the `forms` result.
+Control metadata preserves `required`, `disabled`, `readonly`, `min`, `max`,
+`step`, `minlength`, `maxlength`, and `pattern`, plus `aria-invalid`,
+`aria-describedby`, and `aria-errormessage` text references. The resource writer
+saves this data to `diagnostics/forms.json`.
+
+Use `data-helper-text` to generate Material helper text. Error metadata can come
+from `data-error` or `aria-errormessage`; when `aria-invalid` is active, the
+message is rendered in the Material helper caption using an error color and is
+also emitted as `app:errorContentDescription`. `app:errorEnabled` is reserved
+for applications to switch to the native runtime error state:
+
+```html
+<input id="username" required minlength="3"
+       data-helper-text="Use at least three characters">
+<p id="email_error">Enter a valid email address.</p>
+<input id="email" type="email" aria-invalid="true"
+       aria-errormessage="email_error">
+```
 
 ### Diagnostics
 
@@ -90,6 +190,9 @@ Current warning codes include:
 | `approximated-css` | Android output is useful but not browser-equivalent |
 | `invalid-css-selector` | A stylesheet selector could not be matched |
 | `missing-stylesheet` | A linked stylesheet was not supplied through `convert()` options |
+| `unmapped-web-font` | A remote `@font-face` URL needs an explicit `fontSources` mapping |
+| `unsupported-font-format` | A declared font is not TTF, OTF, or TTC |
+| `invalid-font-face` | An `@font-face` rule is missing a usable family declaration |
 
 Warnings are deduplicated and include element, property, and value context when
 available. CSS custom properties do not produce unsupported-property warnings.
@@ -97,6 +200,20 @@ available. CSS custom properties do not produce unsupported-property warnings.
 ---
 
 ## HTML Tag Reference
+
+### Custom Elements
+
+```javascript
+const converter = new ShiftLayout({
+    customElements: {
+        'status-badge': 'TextView',
+        'feature-panel': 'com.example.views.FeaturePanel',
+    },
+});
+```
+
+Mapped custom elements retain generated IDs, CSS-derived attributes,
+accessibility metadata, constraints, and converted child elements.
 
 ### Layout Containers
 
@@ -150,8 +267,31 @@ available. CSS custom properties do not produce unsupported-property warnings.
 | `<progress value="60" max="100">` | `ProgressBar` | Horizontal style applied automatically when `value`/`max` present |
 | `<meter value="60" max="100">` | `ProgressBar` | Horizontal style with `android:max` and `android:progress` |
 | `<hr>` | `View` (1dp divider) | |
-| `<video>` | `VideoView` | |
-| `<iframe>` | `WebView` | |
+| `<video>` | `VideoView` | Source, poster, playback flags, and fallback text are preserved in `media` |
+| `<audio>` | `VideoView` | Runtime audio source and playback flags are preserved in `media` |
+| `<iframe>` | `WebView` | URL, `srcdoc`, sandbox, and allow policy are preserved in `media` |
+| `<canvas>` | `View` | Width, height, and fallback text are preserved for runtime drawing |
+| `<embed>`, `<object>` | `WebView` | Source/data and MIME type are preserved for runtime loading |
+
+### Embedded Media Metadata
+
+Media and embedded elements are emitted as leaf Android views so HTML fallback
+children are not incorrectly nested inside `VideoView`, `WebView`, or `View`.
+Their runtime contract is returned through `media`:
+
+```javascript
+const { media } = converter.convert(`
+    <video id="intro" src="media/intro.mp4" controls poster="images/intro.png"></video>
+    <iframe id="guide" src="https://example.com/guide" sandbox="allow-scripts"></iframe>
+`);
+```
+
+Records include the generated resource ID, element kind, source, MIME type,
+title, and fallback text. Video/audio records also include playback flags;
+iframe records include `srcdoc`, sandbox, and allow values; canvas records include
+its intrinsic dimensions. The writer saves these records to
+`diagnostics/media.json`. Applications remain responsible for loading URLs,
+configuring playback, rendering canvas content, and enforcing web security policy.
 
 ---
 
@@ -196,6 +336,34 @@ stylesheets and `<style>` elements follow document cascade order. Unmatched link
 are ignored, keeping conversion deterministic and free of hidden file or network
 access.
 
+### Web Fonts
+
+Embedded or supplied CSS may declare local TTF, OTF, and TTC files with
+`@font-face`. ShiftLayout generates an Android font-family resource and applies
+it wherever the declared CSS family is used:
+
+```html
+<style>
+    @font-face { font-family: AppSans; src: url("fonts/app-sans.ttf"); font-weight: 400; }
+    body { font-family: AppSans, sans-serif; }
+</style>
+```
+
+Remote fonts are never downloaded. Map each declared web URL to a contained
+local font path or an existing Android font-family reference:
+
+```javascript
+const result = sculptor.convert(html, {
+    fontSources: {
+        'https://cdn.example.com/app.woff2': 'fonts/app-sans.ttf',
+        'https://cdn.example.com/display.woff2': '@font/display_family',
+    },
+});
+```
+
+When no supported source or explicit mapping is available, ShiftLayout reports
+a warning and uses the next recognized generic CSS family when present.
+
 ### Media Query Profiles
 
 Pass a target media profile to activate matching `@media` rules:
@@ -220,6 +388,47 @@ stylesheet source order and specificity.
 
 When `media` is omitted, conditional rules remain inactive. This avoids silently
 assuming a viewport that may not match the Android target.
+
+### Generated Pseudo-Elements
+
+Stylesheet rules ending in `::before`, `::after`, `:before`, or `:after` can
+generate textual Android content:
+
+```html
+<style>
+    :root { --required-marker: " *"; }
+    label.required::after { content: var(--required-marker); }
+    .status::before { content: "Status: "; color: #336699; }
+    .download::after { content: " " attr(data-format); }
+</style>
+```
+
+Quoted strings, CSS escapes, `attr(...)`, custom properties, cascade
+specificity, `!important`, and `display: none` are supported. On text elements,
+generated content is flattened into the host `android:text`; distinct pseudo
+styling is reported as an approximation. On compatible containers, ShiftLayout
+emits child `TextView`s and maps color, font, alignment, background, spacing,
+and text-transform properties. Unsupported generated content such as `url()`,
+counters, and pseudo-elements on non-container views is omitted with structured
+diagnostics.
+
+### Strict Conversion
+
+Pass `strict: true` to fail conversion when any warning is produced:
+
+```javascript
+try {
+    const result = sculptor.convert(html, { strict: true });
+} catch (error) {
+    if (error.name === 'ShiftLayoutConversionError') {
+        console.error(error.warnings);
+    }
+}
+```
+
+Strict conversion throws a `ShiftLayoutConversionError` after processing the
+document. Its `warnings` property contains the same structured diagnostics that
+normal conversion returns. Strict mode is disabled by default.
 
 ### Colors
 
@@ -469,10 +678,90 @@ Generates: parent becomes `FrameLayout`; FAB div uses `android:layout_gravity="e
 
 ---
 
+## Command-Line Usage
+
+The package installs a `shiftlayout` command that converts an HTML file and
+writes the complete Android resource tree:
+
+```bash
+shiftlayout screen.html --output android-output --layout-name activity_main
+```
+
+The output directory defaults to `android-output`. Local image and mapped font paths are
+resolved relative to the input HTML file. Useful options include:
+
+```text
+--prefix <prefix>
+--default-image-density <qualifier>
+--media-width <size>
+--media-height <size>
+--media-orientation <portrait|landscape>
+--media-type <type>
+--font-source <declared-url> <local-path-or-@font-reference>
+      --strict
+      --extract-resources
+```
+
+Run `shiftlayout --help` for the complete usage text. Successful conversion
+returns exit code `0`, conversion or file failures return `1`, and invalid
+command-line usage returns `2`.
+
+---
+
+## Testing
+
+Run `npm test` for the focused parser, resource, layout, form, and accessibility
+suites plus the broad end-to-end regression coverage. Performance fixtures are
+kept separate so their timing output remains explicit:
+
+```bash
+npm run test:performance
+```
+
+### Debugging A Conversion
+
+Start with strict mode so approximations and unsupported input fail at the
+conversion boundary:
+
+```bash
+shiftlayout screen.html --output debug-output --strict
+```
+
+If strict mode fails, rerun without `--strict` to write the partial Android
+resources and inspect these files:
+
+- `diagnostics/warnings.json` for unsupported or approximated HTML/CSS
+- `diagnostics/assets.json` for missing, rejected, or conflicting files
+- `diagnostics/forms.json` for form constraints and support/error text
+- `diagnostics/interactions.json` for runtime actions that still need app wiring
+- `diagnostics/media.json` for media and embedded-content runtime requirements
+- `diagnostics/extracted-resources.json` for generated value references
+
+For a source-level Node.js debugging session, invoke the packaged CLI through
+Node and pass normal CLI arguments after the script path:
+
+```bash
+node --inspect-brk bin/shiftlayout.js screen.html --output debug-output
+```
+
+After resolving conversion warnings, compile the generated resources with the
+Android SDK to catch resource-name, XML, and reference errors:
+
+```bash
+aapt2 compile --dir debug-output/res -o debug-output/compiled.zip
+```
+
+`aapt2 compile` validates individual resources. A complete Android application
+should also run its normal Gradle resource-link and build tasks because app
+themes, dependencies, minimum SDK choices, and application-owned references are
+outside ShiftLayout's generated resource directory.
+
+---
+
 ## Writing Files
 
 Use the exported resource writer to create an Android-style output tree and copy
-local bitmap assets:
+local bitmap and font assets:
 
 ```javascript
 const ShiftLayout = require('shiftlayout');
@@ -486,11 +775,11 @@ const report = ShiftLayout.writeResources('android-output', result, {
 });
 ```
 
-`baseDir` is the containment root for local image sources. Files that resolve
+`baseDir` is the containment root for local image and font sources. Files that resolve
 outside it, do not exist, or use unsupported formats are skipped and reported.
 PNG, JPEG, WebP, and GIF files are copied. Supported SVG files are converted to
-Android VectorDrawable XML. Remote HTTP, data, and blob URLs stay in the image
-manifest without network access.
+Android VectorDrawable XML. TTF, OTF, and TTC files are copied to `res/font`.
+Remote URLs remain in their asset manifests without network access.
 
 Image density can come from `data-android-density`, a density directory such as
 `xhdpi/`, an `@2x` filename suffix, `imageDensities[source]`, or
@@ -498,9 +787,44 @@ Image density can come from `data-android-density`, a density directory such as
 `res/drawable-hdpi` and `res/drawable-xhdpi`; images without a density use
 `res/drawable`.
 
-The returned report lists written files, copied images, skipped images, and
-asset warnings. The same asset summary is written to
-`diagnostics/assets.json`.
+The returned report lists written files, copied and skipped images, copied and
+skipped fonts, and asset warnings. Source manifests are written to
+`assets/images.json` and `assets/fonts.json`, while the copy summary is written
+to `diagnostics/assets.json`; interaction metadata is written to
+`diagnostics/interactions.json`, form metadata to `diagnostics/forms.json`, and
+embedded-media metadata to `diagnostics/media.json`.
+
+### Optional Value Extraction
+
+Enable repeated Android value extraction through the constructor:
+
+```javascript
+const converter = new ShiftLayout({ extractResources: true });
+```
+
+Repeated compatible literals are replaced across generated layout, drawable,
+and menu XML with `@color`, `@dimen`, and `@string` references. ShiftLayout
+adds `colors.xml`, `dimens.xml`, and `strings.xml` when each type has matches,
+and returns their names and original values through `extractedResources`. The
+writer also saves that manifest to `diagnostics/extracted-resources.json`.
+
+Extraction is disabled by default. Configure individual types and the minimum
+occurrence count when finer control is needed:
+
+```javascript
+const converter = new ShiftLayout({
+    extractResources: {
+        colors: true,
+        dimensions: true,
+        strings: false,
+        minOccurrences: 3,
+    },
+});
+```
+
+Only attributes whose Android types accept the corresponding resource are
+eligible, preventing text that happens to resemble a color or dimension from
+being replaced with an incompatible reference.
 
 ### SVG Conversion
 
@@ -527,9 +851,43 @@ Run the included example:
 node examples/write-android-resources.js
 ```
 
-It writes `res/layout`, `res/drawable`, `res/menu`, `res/values`, an image asset
-manifest, and structured conversion/asset diagnostics under
+It writes `res/layout`, `res/drawable`, `res/menu`, `res/values`, image and font
+asset manifests, and structured conversion/asset diagnostics under
 `examples/android-output/`.
+
+---
+
+## Performance Fixtures
+
+Run the large-document and deeply-nested conversion fixtures with:
+
+```bash
+npm run test:performance
+```
+
+Each fixture reports input size, generated layout size, warning count, and
+elapsed conversion time. Set `SHIFTLAYOUT_PERF_BUDGET_MS` to a positive number
+to enforce a per-fixture time budget; no timing threshold is imposed by default
+because performance varies across machines. CI runs both fixtures as smoke tests.
+
+---
+
+## Android Resource Validation
+
+CI generates a representative layout, shape drawable, navigation vectors and
+menu, and values file, then compiles the complete `res/` directory with Android
+SDK `aapt2`. Generate the same fixture locally with:
+
+```bash
+npm run test:android:generate -- path/to/output
+```
+
+The command only generates the fixture. Compiling it locally requires Android
+SDK Build Tools:
+
+```bash
+aapt2 compile --dir path/to/output/res -o path/to/output/compiled.zip
+```
 
 ---
 
@@ -541,4 +899,4 @@ manifest, and structured conversion/asset diagnostics under
 - `rgba()` and `hsla()` transparency is converted to Android's `#AARRGGBB` format.
 - Shape drawables are deduplicated - the same color + radius combination reuses one file.
 - `<select>` entries (`<option>`) are returned as per-select XML files in `arrays` and combined in `values['arrays.xml']`.
-- `<nav>` menu icon references (`@drawable/ic_nav_1` etc.) must be created manually or replaced with your own icon drawables.
+- `<nav>` menus include generated fallback vector icons (`@drawable/ic_nav_1` etc.); replace them with app-specific icons when appropriate.

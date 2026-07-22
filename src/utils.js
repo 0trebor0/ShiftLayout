@@ -126,6 +126,29 @@ function parseCssStylesheet(cssText, mediaConditions = []) {
     return rules;
 }
 
+function parseFontFaces(cssText) {
+    const faces = [];
+    const input = String(cssText || '');
+    let cursor = 0;
+    while (cursor < input.length) {
+        const open = findNextCssBrace(input, cursor, '{');
+        if (open === -1) break;
+        const prelude = input.slice(cursor, open).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+        const close = findMatchingCssBrace(input, open);
+        if (close === -1) break;
+        const body = input.slice(open + 1, close);
+        if (/^@font-face\b/i.test(prelude)) {
+            faces.push(Object.fromEntries(
+                parseStyleDeclarations(body).map(declaration => [declaration.property, declaration.value])
+            ));
+        } else if (/^@media\b/i.test(prelude)) {
+            faces.push(...parseFontFaces(body));
+        }
+        cursor = close + 1;
+    }
+    return faces;
+}
+
 function normalizeMediaProfile(profile) {
     if (profile === undefined || profile === null || profile === false) return null;
     if (typeof profile !== 'object' || Array.isArray(profile)) {
@@ -893,7 +916,7 @@ function parseTransform(val) {
 }
 
 module.exports = {
-    parseStyle, parseStyleDeclarations, parseCssStylesheet, normalizeMediaProfile, matchesMediaQuery,
+    parseStyle, parseStyleDeclarations, parseCssStylesheet, parseFontFaces, normalizeMediaProfile, matchesMediaQuery,
     selectorSpecificity, resolveCssVariables,
     normalizeStyleValue, escapeXmlAttribute, sanitizeResourceName,
     makeUniqueResourceName,

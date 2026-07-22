@@ -72,28 +72,28 @@ deferred, or removed from scope.
 - [x] Copy contained local bitmap images through an explicit Android resource writer.
 - [x] Add density-aware image destinations, scale-suffix inference, and safe drawable naming.
 - [x] Convert supported SVG geometry, paint, and transforms into Android vector drawables.
-- [ ] Generate or map navigation icons instead of emitting placeholder references.
-- [ ] Map local and web font declarations to Android font resources.
-- [ ] Extract repeated colors, dimensions, and strings into optional value resources.
+- [x] Generate fallback navigation icons instead of emitting unresolved drawable references.
+- [x] Map local and web font declarations to Android font resources.
+- [x] Extract repeated colors, dimensions, and strings into optional value resources.
 
 ## Planned: HTML And Interaction
 
-- [ ] Add explicit handling for audio, video, iframe, canvas, and embedded content.
-- [ ] Improve form grouping, validation metadata, and error/helper text generation.
-- [ ] Add configurable mappings for custom elements and web components.
-- [ ] Represent pseudo-elements such as `::before` and `::after` where Android permits it.
-- [ ] Produce interaction metadata for links, buttons, forms, and navigation targets.
-- [ ] Define extension hooks for application-specific event and data-binding generation.
+- [x] Expand the basic video and iframe mappings and add explicit handling for audio, canvas, and embedded content.
+- [x] Improve form grouping, validation metadata, and error/helper text generation.
+- [x] Add configurable mappings for custom elements and web components.
+- [x] Represent pseudo-elements such as `::before` and `::after` where Android permits it.
+- [x] Produce interaction metadata for links, buttons, forms, and navigation targets.
+- [x] Define extension hooks for application-specific event and data-binding generation.
 
 ## Planned: Tooling And Validation
 
-- [ ] Add a CLI for converting HTML files and writing a complete resource directory.
-- [ ] Add structured warnings with source element and CSS-property context.
-- [ ] Add strict mode that fails on unsupported or invalid input.
-- [ ] Split the regression suite into focused parser, resource, layout, form, and accessibility tests.
-- [ ] Validate generated resources with Android SDK tooling in continuous integration.
-- [ ] Add supported Node.js versions and CI coverage to package documentation.
-- [ ] Add performance fixtures for large documents and deeply nested layouts.
+- [x] Add a CLI for converting HTML files and writing a complete resource directory.
+- [x] Add structured warnings with source element and CSS-property context.
+- [x] Add strict mode that fails when conversion produces structured warnings.
+- [x] Split the regression suite into focused parser, resource, layout, form, and accessibility tests.
+- [x] Validate generated resources with Android SDK tooling in continuous integration.
+- [x] Add supported Node.js versions and CI coverage to package documentation.
+- [x] Add performance fixtures for large documents and deeply nested layouts.
 
 ## Deferred
 

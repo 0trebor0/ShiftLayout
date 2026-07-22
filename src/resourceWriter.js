@@ -4,6 +4,7 @@ const { sanitizeResourceName } = require('./utils');
 const svgToVector = require('./svgToVector');
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const FONT_EXTENSIONS = new Set(['.ttf', '.otf', '.ttc']);
 const DENSITIES = new Set(['ldpi', 'mdpi', 'tvdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi', 'nodpi']);
 
 function writeResources(outputDir, result, options = {}) {
@@ -13,26 +14,83 @@ function writeResources(outputDir, result, options = {}) {
     const outputRoot = path.resolve(outputDir);
     const baseDir = path.resolve(options.baseDir || process.cwd());
     const layoutName = sanitizeResourceName(options.layoutName || 'activity_main', 'activity_main');
-    const report = { writtenFiles: [], copiedImages: [], skippedImages: [], warnings: [] };
+    const report = { writtenFiles: [], copiedImages: [], skippedImages: [], copiedFonts: [], skippedFonts: [], warnings: [] };
 
     fs.mkdirSync(outputRoot, { recursive: true });
     writeFile(outputRoot, `res/layout/${layoutName}.xml`, result.layout || '', report);
     writeMap(outputRoot, 'res/drawable', result.drawables, report);
     writeMap(outputRoot, 'res/menu', result.menus, report);
     writeMap(outputRoot, 'res/values', result.values, report);
+    writeMap(outputRoot, 'res/font', result.fonts, report);
     writeFile(outputRoot, 'assets/images.json', JSON.stringify(result.assets?.images || [], null, 2), report);
+    writeFile(outputRoot, 'assets/fonts.json', JSON.stringify(result.assets?.fonts || [], null, 2), report);
     writeFile(outputRoot, 'diagnostics/warnings.json', JSON.stringify(result.warnings || [], null, 2), report);
+    writeFile(outputRoot, 'diagnostics/interactions.json', JSON.stringify(result.interactions || [], null, 2), report);
+    writeFile(outputRoot, 'diagnostics/forms.json', JSON.stringify(result.forms || [], null, 2), report);
+    writeFile(outputRoot, 'diagnostics/media.json', JSON.stringify(result.media || [], null, 2), report);
+    writeFile(outputRoot, 'diagnostics/extracted-resources.json', JSON.stringify(result.extractedResources || {}, null, 2), report);
 
     for (const image of result.assets?.images || []) {
         copyLocalImage(outputRoot, baseDir, image, options, report);
     }
+    for (const font of result.assets?.fonts || []) {
+        copyLocalFont(outputRoot, baseDir, font, report);
+    }
     writeFile(outputRoot, 'diagnostics/assets.json', JSON.stringify({
         copiedImages: report.copiedImages,
         skippedImages: report.skippedImages,
+        copiedFonts: report.copiedFonts,
+        skippedFonts: report.skippedFonts,
         warnings: report.warnings,
     }, null, 2), report);
 
     return report;
+}
+
+function copyLocalFont(outputRoot, baseDir, font, report) {
+    const source = String(font.source || '');
+    if (!source) {
+        report.skippedFonts.push({
+            family: font.family,
+            declaredSource: font.declaredSource,
+            reason: font.remote ? 'remote' : 'missing-source',
+        });
+        return;
+    }
+    const cleanSource = decodePath(source.split(/[?#]/)[0]);
+    const candidate = resolveSource(baseDir, cleanSource);
+    if (!candidate || !fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+        warnFont(report, 'missing-font', font, `Local font "${source}" was not found beneath baseDir.`);
+        return;
+    }
+    const realBase = fs.realpathSync(baseDir);
+    const realSource = fs.realpathSync(candidate);
+    if (!isInside(realBase, realSource)) {
+        warnFont(report, 'font-outside-base-dir', font, `Local font "${source}" resolves outside baseDir and was not copied.`);
+        return;
+    }
+    const extension = path.extname(cleanSource).toLowerCase();
+    if (!FONT_EXTENSIONS.has(extension)) {
+        warnFont(report, 'unsupported-font-format', font, `Font format "${extension || '(none)'}" cannot be copied as an Android font resource.`);
+        return;
+    }
+    const target = resolveInside(outputRoot, path.join('res', 'font', `${sanitizeResourceName(font.resource, 'font')}${extension}`));
+    if (hasResourceNameConflict(path.dirname(target), font.resource, target)) {
+        warnFont(report, 'font-name-conflict', font, `Font resource "${font.resource}" conflicts with another file in res/font.`);
+        return;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(realSource, target);
+    report.writtenFiles.push(target);
+    report.copiedFonts.push({
+        family: font.family,
+        declaredSource: font.declaredSource,
+        source,
+        target,
+        resource: font.resource,
+        weight: font.weight,
+        style: font.style,
+    });
 }
 
 function writeMap(outputRoot, directory, files, report) {
@@ -173,6 +231,11 @@ function decodePath(value) {
 function warnImage(report, code, source, message) {
     report.warnings.push({ severity: 'warning', code, source, message });
     report.skippedImages.push({ source, reason: code });
+}
+
+function warnFont(report, code, font, message) {
+    report.warnings.push({ severity: 'warning', code, source: font.source, family: font.family, message });
+    report.skippedFonts.push({ family: font.family, source: font.source, resource: font.resource, reason: code });
 }
 
 module.exports = writeResources;
